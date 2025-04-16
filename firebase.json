@@ -1,0 +1,42 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "trackmydough-293b6",
+          "appId": "1:1026802612394:android:7f3bfde28be22a9ffaf8d3",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "trackmydough-293b6",
+          "configurations": {
+            "android": "1:1026802612394:android:7f3bfde28be22a9ffaf8d3",
+            "ios": "1:1026802612394:ios:acc3d1e1f9d2aad9faf8d3",
+            "macos": "1:1026802612394:ios:acc3d1e1f9d2aad9faf8d3",
+            "web": "1:1026802612394:web:a11431ff0109048ffaf8d3",
+            "windows": "1:1026802612394:web:acb238f184f4ae18faf8d3"
+          }
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR\" run lint",
+        "npm --prefix \"$RESOURCE_DIR\" run build"
+      ]
+    }
+  ]
+}

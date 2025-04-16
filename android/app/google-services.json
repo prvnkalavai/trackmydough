@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1026802612394",
+    "project_id": "trackmydough-293b6",
+    "storage_bucket": "trackmydough-293b6.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1026802612394:android:7f3bfde28be22a9ffaf8d3",
+        "android_client_info": {
+          "package_name": "com.example.trackmydough"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAyTZ-oA2BFPWrtxI_yznaur-uIguRxRWE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
