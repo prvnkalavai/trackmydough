@@ -2381,3 +2381,125 @@ export const getSankeyData = onCall(async (request) => {
   }
 });
 
+// --- NEW: getSunburstData Function ---
+export const getSunburstData = onCall(async (request) => {
+  logger.info("getSunburstData function invoked.", { uid: request.auth?.uid, data: request.data });
+
+  // 1. Authentication Check
+  if (!request.auth || !request.auth.uid) {
+    logger.error("Authentication error: User is not authenticated.", { functionName: "getSunburstData" });
+    throw new HttpsError("unauthenticated", "The function must be called while authenticated.");
+  }
+  const userId = request.auth.uid;
+
+  // 2. Parameter Extraction and Validation
+  const { period, dateOffset = 0 } = request.data as { period: string; dateOffset?: number };
+
+  if (!period || !["monthly", "yearly", "yearToDate"].includes(period)) {
+    logger.error("Invalid 'period' parameter.", { userId, period });
+    throw new HttpsError("invalid-argument", "Invalid 'period' specified. Must be 'monthly', 'yearly', or 'yearToDate'.");
+  }
+
+  // dateOffset validation (already defaults to 0 if not provided)
+  if (typeof dateOffset !== "number" || isNaN(dateOffset)) {
+    logger.error("Invalid 'dateOffset' parameter. Must be a number.", { userId, dateOffset });
+    throw new HttpsError("invalid-argument", "Invalid 'dateOffset' specified. Must be a number.");
+  }
+
+  // 3. Log Invocation
+  logger.info("getSunburstData successfully invoked with valid parameters.", { userId, period, dateOffset });
+
+  // Wrap main logic in a try-catch for comprehensive error handling
+  try {
+    // 4. Calculate Date Range
+    const dateRange = getDateRangeForSankey(period, dateOffset);
+
+    if (!dateRange) {
+      logger.error("Failed to calculate date range for Sunburst chart.", { userId, period, dateOffset });
+      throw new HttpsError("invalid-argument", "Failed to calculate date range.");
+    }
+
+    logger.info(`Calculated date range for Sunburst: Start - ${dateRange.startDate.toDate().toISOString()}, End - ${dateRange.endDate.toDate().toISOString()}`, { userId, period, dateOffset });
+
+    // 5. Fetch and Process Transactions
+    let fetchedTransactionsCount = 0;
+    const expenseCategories: { [key: string]: number } = {};
+
+    try {
+      const transactionsSnapshot = await db.collection("transactions")
+        .where("userId", "==", userId)
+        .where("date", ">=", dateRange.startDate)
+        .where("date", "<=", dateRange.endDate)
+        .get();
+
+      fetchedTransactionsCount = transactionsSnapshot.size;
+      logger.info(`Fetched ${fetchedTransactionsCount} transactions for Sunburst data.`, { userId, period, dateOffset });
+
+      transactionsSnapshot.forEach((doc) => {
+        const tx = doc.data();
+        const amount = tx.amount as number;
+        if (typeof amount === "number" && !isNaN(amount) && amount > 0) { // Expense
+          const primaryCategory = (tx.category && tx.category[0]) ? tx.category[0] : "Uncategorized";
+          expenseCategories[primaryCategory] = (expenseCategories[primaryCategory] || 0) + amount;
+        }
+      });
+      logger.info("Aggregated expense categories for Sunburst:", { userId, expenseCategories });
+    } catch (dbError) {
+      logger.error("Firestore error while fetching or processing transactions for Sunburst:", { userId, period, dateOffset, error: dbError });
+      throw new HttpsError("internal", "An error occurred while fetching financial data for the Sunburst chart.");
+    }
+
+    // 6. Format data for Sunburst chart
+    const sunburstData = {
+      name: "Total Expenses",
+      children: [] as { name: string; value: number }[],
+    };
+
+    try {
+      for (const categoryName in expenseCategories) {
+        if (Object.prototype.hasOwnProperty.call(expenseCategories, categoryName)) {
+          sunburstData.children.push({
+            name: categoryName,
+            value: expenseCategories[categoryName],
+          });
+        }
+      }
+      logger.info("Formatted Sunburst data:", { userId, sunburstData });
+    } catch (formatError) {
+      logger.error("Error formatting Sunburst data:", { userId, period, dateOffset, error: formatError });
+      throw new HttpsError("internal", "An error occurred while formatting data for the Sunburst chart.");
+    }
+
+    // 7. Return Processed Data
+    return {
+      success: true,
+      data: {
+        userId,
+        period,
+        dateOffset,
+        dateRange: {
+          startDate: dateRange.startDate.toDate().toISOString(),
+          endDate: dateRange.endDate.toDate().toISOString(),
+        },
+        transactionsFetched: fetchedTransactionsCount,
+        sunburstData,
+      },
+    };
+  } catch (error) {
+    // Catch any errors not caught by more specific blocks or re-thrown HttpsErrors
+    if (error instanceof HttpsError) {
+      // If it's already an HttpsError, just rethrow it
+      throw error;
+    }
+    // For unexpected errors, log the details and throw a generic internal error
+    logger.error("Unexpected error in getSunburstData:", {
+      userId,
+      period,
+      dateOffset,
+      error, // Log the actual error object
+      errorMessage: (error instanceof Error) ? error.message : "Unknown error",
+      errorStack: (error instanceof Error) ? error.stack : undefined,
+    });
+    throw new HttpsError("internal", "An unexpected error occurred while processing your request.");
+  }
+});
