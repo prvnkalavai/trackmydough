@@ -20,12 +20,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
   double? _totalExpenses;
   double? _savingsBuffer;
 
+  // Sunburst chart specific state variables
+  List<Map<String, dynamic>>? _sunburstData;
+  double? _sunburstTotalExpenses;
+  bool _isSunburstLoading = false;
+  String? _sunburstErrorMessage;
+
   final FirebaseFunctions _functions = FirebaseFunctions.instance;
 
   @override
   void initState() {
     super.initState();
     _fetchSankeyData();
+    _fetchSunburstData(); // Call to fetch sunburst data
   }
 
   Future<void> _fetchSankeyData() async {
@@ -84,6 +91,55 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  Future<void> _fetchSunburstData() async {
+    setState(() {
+      _isSunburstLoading = true;
+      _sunburstErrorMessage = null;
+    });
+
+    try {
+      final HttpsCallable callable = _functions.httpsCallable('getSunburstData');
+      final HttpsCallableResult result = await callable.call(<String, dynamic>{
+        'period': _selectedPeriod,
+        'dateOffset': _dateOffset,
+      });
+
+      if (result.data != null) {
+        final Map<String, dynamic> data = result.data as Map<String, dynamic>;
+        final List<dynamic>? hierarchicalData = data['hierarchicalData'] as List<dynamic>?;
+        final num? totalExpensesNum = data['totalExpenses'] as num?;
+
+        setState(() {
+          _sunburstData = hierarchicalData
+              ?.map((item) => item as Map<String, dynamic>)
+              .toList();
+          _sunburstTotalExpenses = totalExpensesNum?.toDouble();
+        });
+      } else {
+        setState(() {
+          _sunburstData = null;
+          _sunburstTotalExpenses = null;
+        });
+      }
+    } on FirebaseFunctionsException catch (e) {
+      setState(() {
+        _sunburstErrorMessage = e.message ?? "An unknown error occurred while fetching Sunburst data.";
+        _sunburstData = null;
+        _sunburstTotalExpenses = null;
+      });
+    } catch (e) {
+      setState(() {
+        _sunburstErrorMessage = "An unexpected error occurred: $e";
+        _sunburstData = null;
+        _sunburstTotalExpenses = null;
+      });
+    } finally {
+      setState(() {
+        _isSunburstLoading = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -107,6 +163,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         _dateOffset = 0; // Reset offset when changing period type
                       });
                       _fetchSankeyData();
+                      _fetchSunburstData(); // Also fetch sunburst data
                     }
                   },
                 ),
@@ -121,6 +178,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         _dateOffset = 0; // Reset offset
                       });
                       _fetchSankeyData();
+                      _fetchSunburstData(); // Also fetch sunburst data
                     }
                   },
                 ),
@@ -135,6 +193,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         _dateOffset = 0; // YTD is always current year, offset 0
                       });
                       _fetchSankeyData();
+                      _fetchSunburstData(); // Also fetch sunburst data
                     }
                   },
                 ),
@@ -198,6 +257,82 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ],
               ),
             ),
+          // --- Sunburst Chart Section ---
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (_isSunburstLoading)
+                  const Center(child: CircularProgressIndicator())
+                else if (_sunburstErrorMessage != null)
+                  Center(child: Text('Sunburst Error: $_sunburstErrorMessage'))
+                else if (_sunburstData != null && _sunburstData!.isNotEmpty)
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Spending Breakdown ${(_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) ? "- Total: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_sunburstTotalExpenses)} " : ""}',
+                        style: Theme.of(context).textTheme.titleLarge,
+                      ),
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        height: 350, // Increased height for better visualization
+                        child: SfSunburstChart(
+                          dataSource: _sunburstData!,
+                          xValueMapper: (dynamic data, _) => data['name'] as String,
+                          yValueMapper: (dynamic data, _) => data['value'] as num,
+                          childItemsPath: 'children',
+                          palette: const <Color>[ // Added color palette
+                            Colors.blue, Colors.green, Colors.orange, Colors.red, Colors.purple,
+                            Colors.brown, Colors.pink, Colors.teal, Colors.indigo, Colors.cyan,
+                            Colors.lime, Colors.amber,
+                          ],
+                          radius: '95%', // Overall radius
+                          innerRadius: '30%', // Creates a donut hole
+                          dataLabelSettings: SunburstDataLabelSettings(
+                            isVisible: true,
+                            labelPosition: SunburstLabelPosition.circular,
+                            labelRotationMode: SunburstLabelRotationMode.angle,
+                            labelFormatter: (SunburstArgs args) {
+                              final String name = args.text ?? (args.dataPoint?['name'] as String? ?? '');
+                              if (_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0 && args.value != null) {
+                                final double percentage = (args.value! / _sunburstTotalExpenses!) * 100;
+                                if (percentage < 2) return ''; // Hide label for very small segments
+                                return '${name}\n(${percentage.toStringAsFixed(1)}%)';
+                              }
+                              return name;
+                            },
+                            textStyle: const TextStyle(fontSize: 9, color: Colors.black87, fontWeight: FontWeight.w500),
+                          ),
+                          tooltipSettings: SunburstTooltipSettings(
+                            enable: true,
+                            tooltipFormatter: (SunburstArgs args) {
+                              final String name = args.text ?? (args.dataPoint?['name'] as String? ?? '');
+                              final double value = args.value ?? 0;
+                              if (_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) {
+                                final double percentage = (value / _sunburstTotalExpenses!) * 100;
+                                return '$name: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(value)} (${percentage.toStringAsFixed(1)}%)';
+                              }
+                              return '$name: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(value)}';
+                            }
+                          ),
+                          selectionSettings: SunburstSelectionSettings( // Added selection settings
+                            enable: true,
+                            mode: SunburstSelectionMode.point, // PointSelectionMode is for SfCartesianChart, Sunburst uses SunburstSelectionMode
+                            selectedColor: Colors.orangeAccent.shade700,
+                            selectedOpacity: 0.9,
+                            unselectedOpacity: 0.5,
+                          ),
+                        ),
+                      ),
+                    ],
+                  )
+                else
+                  const Center(child: Text('No spending data for Sunburst chart for the selected period.')),
+              ],
+            ),
+          ),
         ],
       ),
     );
