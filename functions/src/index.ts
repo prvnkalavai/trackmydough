@@ -648,7 +648,10 @@ export const getFinancialData = onCall(
     logger.info(`getFinancialData: Intent: ${intent}`, {entities});
 
     // 3. Process Based on Intent
+    const baseTransactionQuery = db.collection("transactions").where("userId", "==", userId);
+    const baseReceiptQuery = db.collection("receipts").where("userId", "==", userId);
     let responseText = "Sorry, I couldn't understand that request.";
+    // const defaultPeriod = 'this_month';
 
     try {
       const baseQuery = db.collection("transactions").where("userId", "==", userId);
@@ -732,30 +735,77 @@ export const getFinancialData = onCall(
         logger.info(`Processing GET_TRANSACTIONS_BY_CATEGORY for '${category}', period '${period}', limit ${limit}`);
 
         // Start building query
-        let categoryQuery = baseQuery.where("category", "array-contains", category); // Use array-contains
+        let transactionQuery = baseTransactionQuery;
+        // let categoryQuery = baseQuery.where("category", "array-contains", category); // Use array-contains
         let periodDescription = "";
+        const dateRange = period ? getDateRange(period) : null;
 
-        // Add date range if period is specified
-        if (period) {
-          const dateRange = getDateRange(period);
-          if (dateRange) {
-            categoryQuery = categoryQuery
-              .where("date", ">=", dateRange.start)
-              .where("date", "<=", dateRange.end);
-            periodDescription = ` ${period.replace(/_/g, " ")}`;
-          } else {
-            logger.warn(`Invalid period '${period}' specified for category query.`);
-            // Optionally notify user or proceed without date filter
-          }
+        if (dateRange) {
+          transactionQuery = transactionQuery.where("date", ">=", dateRange.start).where("date", "<=", dateRange.end);
+          periodDescription = ` ${(period ?? "").replace(/_/g, " ")}`;
         }
 
-        finalQuery = categoryQuery.orderBy("date", "desc").limit(limit);
-        const querySnapshot = await finalQuery.get();
+        let transactions: admin.firestore.DocumentData[] = [];
+        // Check if it looks like a granular category (heuristic)
+        if (category.includes(">")) {
+          // Granular: Need to check receipts
+          logger.info("Granular category detected. Querying receipts first.");
+          let receiptQuery = baseReceiptQuery.where("status", "==", "matched"); // Only matched receipts
+          if (dateRange) {
+            receiptQuery = receiptQuery.where("transactionDate", ">=", dateRange.start).where("transactionDate", "<=", dateRange.end);
+          }
+          // We might need to fetch more receipts than the limit and filter/sort later
+          const receiptSnapshot = await receiptQuery.limit(50).get(); // Limit receipt query for performance
+          const relevantTxnIds = new Set<string>();
 
-        if (querySnapshot.empty) {
+          receiptSnapshot.docs.forEach((doc) => {
+            const receipt = doc.data();
+            const lineItems = receipt?.lineItems as { category?: string }[] ?? [];
+            if (lineItems.some((item) => item.category?.trim() === category?.trim())) {
+              if (receipt.matchedTransactionId) {
+                relevantTxnIds.add(receipt.matchedTransactionId);
+              }
+            }
+          });
+
+          if (relevantTxnIds.size === 0) {
+            // No receipts had line items matching this granular category
+          } else {
+            logger.info(`Found ${relevantTxnIds.size} relevant transactions via receipts. Fetching details...`);
+            // Firestore 'in' query limited to 30 IDs per query
+            const idChunks = Array.from(relevantTxnIds).reduce((acc, cur, i) => {
+              const chunkIndex = Math.floor(i / 30);
+              if (!acc[chunkIndex]) {
+                acc[chunkIndex] = [];
+              }
+              acc[chunkIndex].push(cur);
+              return acc;
+            }, [] as string[][]);
+
+            for (const chunk of idChunks) {
+              if (chunk.length > 0) {
+                const txnSnapshot = await db.collection("transactions")
+                  .where(admin.firestore.FieldPath.documentId(), "in", chunk)
+                  .get();
+                transactions = transactions.concat(txnSnapshot.docs.map((d) => d.data()));
+              }
+            }
+            // Sort by date descending after fetching all chunks
+            transactions.sort((a, b) => (b.date as Timestamp).toMillis() - (a.date as Timestamp).toMillis());
+            // Apply limit
+            transactions = transactions.slice(0, limit);
+          }
+        } else {
+          // Broad Category: Query transactions directly
+          logger.info("Broad category detected. Querying transactions directly.");
+          transactionQuery = transactionQuery.where("category", "array-contains", category);
+          const querySnapshot = await transactionQuery.orderBy("date", "desc").limit(limit).get();
+          transactions = querySnapshot.docs.map((doc) => doc.data());
+        }
+
+        if (transactions.length === 0) {
           responseText = `No transactions found for category "${category}"${periodDescription}.`;
         } else {
-          const transactions = querySnapshot.docs.map((doc) => doc.data());
           responseText = `Okay, here are the latest ${transactions.length} transactions for "${category}"${periodDescription}:\n`;
           transactions.forEach((tx) => {/* ... format transaction line (same as GET_RECENT_TRANSACTIONS) ... */
             const date = (tx.date as Timestamp)?.toDate();
@@ -819,22 +869,51 @@ export const getFinancialData = onCall(
         }
         logger.info(`Processing GET_SPENDING_SUMMARY_BY_CATEGORY for '${category}', period '${period}'`);
 
-        finalQuery = baseQuery
-          .where("category", "array-contains", category) // Filter by category
-          .where("date", ">=", dateRange.start)
-          .where("date", "<=", dateRange.end)
-          .where("amount", "<", 0); // Expenses only
-
-        const querySnapshot = await finalQuery.get();
         let totalSpending = 0;
-        querySnapshot.forEach((doc) => {
-          totalSpending += (doc.data().amount ?? 0);
-        });
+        // Check if granular
+        if (category.includes(">")) {
+          // Granular: Aggregate from receipts
+          logger.info("Granular category summary. Querying receipts...");
+          const receiptQuery = baseReceiptQuery
+            .where("status", "==", "matched")
+            .where("transactionDate", ">=", dateRange.start)
+            .where("transactionDate", "<=", dateRange.end);
 
-        if (querySnapshot.empty) {
+          // This might read MANY receipts for large date ranges - potential performance issue
+          const receiptSnapshot = await receiptQuery.get();
+          receiptSnapshot.forEach((doc) => {
+            const receipt = doc.data();
+            const lineItems = receipt?.lineItems as { category?: string, price?: number }[] ?? [];
+            lineItems.forEach((item) => {
+              if (item.category?.trim() === category?.trim()) {
+                totalSpending += (item.price ?? 0); // Summing receipt line item prices directly
+              }
+            });
+          });
+          // NOTE: This sums receipt *line item* prices, which might differ slightly
+          // from the corresponding *transaction* amounts if receipt matching/extraction wasn't perfect.
+        } else {
+          // Broad Category: Aggregate from transactions
+          logger.info("Broad category summary. Querying transactions...");
+          const transactionQuery = baseTransactionQuery
+            .where("category", "array-contains", category)
+            .where("date", ">=", dateRange.start)
+            .where("date", "<=", dateRange.end)
+            .where("amount", "<", 0);
+
+          const querySnapshot = await transactionQuery.get();
+          let totalSpending = 0;
+          querySnapshot.forEach((doc) => {
+            totalSpending += (doc.data().amount ?? 0);
+          });
+          logger.info(`Total spending for category "${category}": ${totalSpending}`);
+        }
+
+        if (totalSpending === 0 && !category.includes(">")) {
+          // If broad category sum is 0, maybe check granular? Or just report 0.
           responseText = `No spending found for category "${category}" ${period.replace(/_/g, " ")}.`;
         } else {
-          const totalString = Math.abs(totalSpending).toLocaleString("en-US", {style: "currency", currency: "USD"}); // Assume USD
+          const totalString = Math.abs(totalSpending).toLocaleString("en-US", {style: "currency", currency: "USD"});
           responseText = `You spent ${totalString} on ${category} ${period.replace(/_/g, " ")}.`;
         }
         break;
@@ -871,6 +950,110 @@ export const getFinancialData = onCall(
         } else {
           const totalString = Math.abs(totalSpending).toLocaleString("en-US", {style: "currency", currency: "USD"}); // Assume USD
           responseText = `You spent ${totalString} at ${merchant} ${period.replace(/_/g, " ")}.`;
+        }
+        break;
+      }
+
+      case "GET_RECEIPT_DETAILS": {
+        const merchant = entities.merchant as string | undefined;
+        const category = entities.category as string | undefined; // Handle category lookup later if needed
+        const period = entities.period as string | undefined;
+        const date = entities.date as string | undefined; // Specific date YYYY-MM-DD
+        const limit = 1; // Usually looking for one specific transaction/receipt
+
+        logger.info("Processing GET_RECEIPT_DETAILS", {merchant, category, period, date});
+
+        // --- Determine Query Filters ---
+        let targetQuery = baseQuery;
+
+        // Filter by Merchant or Category (Prioritize Merchant if both given?)
+        if (merchant) {
+          targetQuery = targetQuery.where("merchantName", "==", merchant);
+        } else if (category) {
+          // TODO: Implement logic to find the *latest* transaction matching a category if only category is given.
+          // This requires a separate query first or more complex logic.
+          // For now, we'll primarily rely on merchant/date.
+          responseText = "Sorry, finding receipts by category only isn't supported yet. Try specifying a merchant or date.";
+          break; // Exit this case for now
+        } else if (!date && !period) {
+          // If no merchant, category, date, or period, we don't know which receipt to get
+          responseText = "Please specify a merchant, category, or date for the receipt you want to see.";
+          break;
+        }
+
+        // Filter by Date/Period
+        let dateRange: { start: Timestamp; end: Timestamp } | null = null;
+        if (date) { // Specific date takes precedence
+          try {
+            const specificDate = new Date(date + "T12:00:00Z"); // Assume UTC noon to avoid timezone issues near midnight
+            if (!isNaN(specificDate.getTime())) {
+              // Create a range for the whole day
+              dateRange = {
+                start: Timestamp.fromDate(new Date(specificDate.setHours(0, 0, 0, 0))),
+                end: Timestamp.fromDate(new Date(specificDate.setHours(23, 59, 59, 999))),
+              };
+            }
+          } catch (e) {
+            logger.warn("Invalid date format provided:", {date});
+          }
+        } else if (period) { // Use period if no specific date
+          dateRange = getDateRange(period);
+        }
+
+        if (dateRange) {
+          targetQuery = targetQuery.where("date", ">=", dateRange.start).where("date", "<=", dateRange.end);
+        } else if (!merchant && !category) {
+          // Avoid overly broad query if no date/period resolved and no merchant/category given
+          responseText = "Please provide a valid date, time period, merchant, or category.";
+          break;
+        }
+
+        // --- Execute Query ---
+        // Find the most recent matching transaction first
+        finalQuery = targetQuery.orderBy("date", "desc").limit(limit);
+        const transactionSnapshot = await finalQuery.get();
+
+        if (transactionSnapshot.empty) {
+          responseText = "Sorry, I couldn't find a matching transaction for that request.";
+          break;
+        }
+
+        // --- Check for Linked Receipt ---
+        const transactionDoc = transactionSnapshot.docs[0]; // Get the first (latest) match
+        const transactionData = transactionDoc.data();
+        const linkedReceiptId = transactionData.linkedReceiptId as string | undefined;
+
+        if (!linkedReceiptId) {
+          responseText = `I found the transaction ${merchant ? `at ${merchant}` : ""}, but there's no receipt linked to it.`;
+          break;
+        }
+
+        // --- Fetch and Format Receipt ---
+        try {
+          const receiptRef = db.collection("receipts").doc(linkedReceiptId);
+          const receiptSnapshot = await receiptRef.get();
+          if (!receiptSnapshot.exists) {
+            logger.error(`Receipt ${linkedReceiptId} linked in transaction ${transactionDoc.id} but not found.`);
+            responseText = "I found the transaction, but there was an error retrieving the linked receipt details.";
+          } else {
+            const receipt = receiptSnapshot.data();
+            const lineItems = receipt?.lineItems as { description: string, quantity: number, price: number, category?: string }[] ?? [];
+            responseText = `Okay, here's what was on the receipt from ${receipt?.vendorName ?? merchant ?? "that transaction"}:\n`;
+            if (lineItems.length > 0) {
+              lineItems.forEach((item) => {
+                const priceString = (item.price ?? 0).toLocaleString("en-US", {style: "currency", currency: transactionData.currencyCode ?? "USD"});
+                const categoryString = item.category ? ` (${item.category})` : ""; // Add category if available
+                responseText += `- ${item.description ?? "Item"} (Qty: ${item.quantity ?? 1}) ${priceString}${categoryString}\n`;
+              });
+            } else {
+              responseText += "- No line items were extracted from this receipt.\n";
+            }
+            responseText += `Total: ${(receipt?.totalAmount ?? 0).toLocaleString("en-US"
+              , {style: "currency", currency: transactionData.currencyCode ?? "USD"})}`;
+          }
+        } catch (receiptError) {
+          logger.error(`Error fetching linked receipt ${linkedReceiptId}`, {receiptError});
+          responseText = "I found the transaction, but couldn't fetch the receipt details.";
         }
         break;
       }
@@ -1461,7 +1644,10 @@ export const generateInsights = onCall(
  */
 export const processReceiptImage = onCall(
   // Requires Gemini API Key. Increase memory/timeout if processing large images/complex receipts.
-  {memory: "512MiB", timeoutSeconds: 120},
+  {
+    memory: "1GiB",
+    timeoutSeconds: 300,
+  },
   async (request) => {
     // 1. Authentication Check
     if (!request.auth) {
@@ -1483,16 +1669,20 @@ export const processReceiptImage = onCall(
       imageDataBase64;
 
     // 3. Initialize Gemini Client (Vision Model)
-    let model: ReturnType<GoogleGenerativeAI["getGenerativeModel"]>;
+    let visionModel: ReturnType<GoogleGenerativeAI["getGenerativeModel"]>;
+    let textModel: ReturnType<GoogleGenerativeAI["getGenerativeModel"]>;
+    let genAI: GoogleGenerativeAI;
     try {
       const apiKey = geminiApiKey.value();
       if (!apiKey) {
         throw new Error("Gemini API Key parameter is missing.");
       }
-      const genAI = new GoogleGenerativeAI(apiKey);
-      model = genAI.getGenerativeModel({
+      genAI = new GoogleGenerativeAI(apiKey);
+      visionModel = genAI.getGenerativeModel({model: "gemini-2.5-flash-preview-04-17" /* or vision model */});
+
+      textModel = genAI.getGenerativeModel({
         // Use a model supporting vision input
-        model: "gemini-2.0-flash", // Or gemini-pro-vision, gemini-1.5-pro-latest
+        model: "gemini-2.5-flash-preview-04-17", // Or gemini-pro-vision, gemini-1.5-pro-latest
         safetySettings: [ // Standard safety settings
           {category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE},
           {category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE},
@@ -1510,18 +1700,22 @@ export const processReceiptImage = onCall(
     }
 
     // 4. Craft Multimodal Prompt
-    const promptText = `
+    const extractionPromptText = `
       Analyze the provided receipt image. Extract the following information accurately:
       - vendorName (string): The name of the store or vendor.
-      - transactionDate (string): The date of the transaction in YYYY-MM-DD format. If time is available, include it, otherwise just the date.
-      - totalAmount (number): The final total amount paid.
-      - currencyCode (string): The ISO 4217 currency code (e.g., "USD", "CAD").
-      - lineItems (array of objects): Extract each item listed on the receipt. Each object in the array should have:
+      - transactionDate (string): The date of the transaction in YYYY-MM-DD format. If time is available, include it. Use null if not found.
+      - totalAmount (number): The final total amount paid. Use null if not found.
+      - currencyCode (string): The ISO 4217 currency code (e.g., "USD", "CAD"). Use null if not found.
+      - lineItems (array of objects): Extract each item listed on the receipt. Each object in the array MUST contain ONLY the following three fields:
           - description (string): Name or description of the item.
-          - quantity (number): Quantity purchased (default to 1 if not specified).
-          - price (number): The total price paid for that line item (quantity * unit price).
+          - quantity (number): Quantity purchased. Default to 1 if not specified or unclear. MUST be a number.
+          - price (number): The total price paid for that line item (quantity * unit price). MUST be a number.
+          Do NOT include any other fields within the line item objects. 
+          Ensure correct comma placement between properties within each line item object.
 
-      Respond ONLY with a valid JSON object containing these fields. Use null for fields you cannot determine. Ensure all monetary values are numbers.
+      Respond ONLY with a single, valid JSON object containing these fields. Use null for top-level fields you cannot determine.
+      Ensure all monetary values (totalAmount, price) are numbers, not strings.
+      Ensure quantity is a number.
 
       Example JSON structure:
       {
@@ -1544,30 +1738,22 @@ export const processReceiptImage = onCall(
       },
     };
 
-    const requestParts = [promptText, imagePart];
+    const extractionRequestParts = [extractionPromptText, imagePart];
 
     // 5. Call Gemini API
-    let parsedJsonResponse: unknown = null;
-    let rawGeminiResponse = "";
+    let parsedExtractionJson: Record<string, unknown> | null = null;
+    let rawExtractionResponse = "";
     try {
-      logger.info(`processReceiptImage: Sending receipt image and prompt to Gemini for user ${userId}...`);
-      const result = await model.generateContent(requestParts);
-      const response = result.response;
-      rawGeminiResponse = response.text() ?? "";
-      logger.info(`processReceiptImage: Received response from Gemini for user ${userId}. Attempting JSON parse...`);
-
-      if (rawGeminiResponse) {
+      logger.info("Sending receipt image and prompt to Gemini for extraction...");
+      const result = await visionModel.generateContent(extractionRequestParts);
+      rawExtractionResponse = result.response.text() ?? "";
+      if (rawExtractionResponse) {
         // Attempt to clean potential markdown fences (though less common with direct JSON mime type)
-        let cleanedResponse = rawGeminiResponse.trim();
-        if (cleanedResponse.startsWith("```json")) {
-          cleanedResponse = cleanedResponse.substring(7, cleanedResponse.length - 3).trim();
-        } else if (cleanedResponse.startsWith("```")) {
-          cleanedResponse = cleanedResponse.substring(3, cleanedResponse.length - 3).trim();
-        }
-
-        logger.info("Cleaned Gemini response:", {cleanedResponse});
-        parsedJsonResponse = JSON.parse(cleanedResponse);
-        logger.info("Successfully parsed JSON response from Gemini.");
+        const cleanedResponse = rawExtractionResponse.trim().replace(/^```json|```$/g, "").trim();
+        logger.info("Cleaned extraction response:", {cleanedResponse});
+        parsedExtractionJson = JSON.parse(cleanedResponse);
+        if (typeof parsedExtractionJson !== "object" || parsedExtractionJson === null) throw new Error("Parsed JSON is not an object.");
+        logger.info("Successfully parsed JSON response from Gemini extraction.");
       } else {
         logger.warn("processReceiptImage: Gemini returned an empty text response.");
         throw new HttpsError("internal", "AI analysis returned no data.");
@@ -1576,24 +1762,28 @@ export const processReceiptImage = onCall(
       let errorMessage = "Unknown error during Gemini API call or JSON parsing";
       if (error instanceof Error) errorMessage = error.message;
       logger.error(`processReceiptImage: Gemini API call or parsing failed for user ${userId}.`
-        , {error: errorMessage, rawResponse: rawGeminiResponse});
+        , {error: errorMessage, rawResponse: rawExtractionResponse});
       throw new HttpsError("internal", `AI analysis failed: ${errorMessage}`);
     }
+    if (!parsedExtractionJson) {
+      throw new HttpsError("internal", "Failed to extract data from receipt image.");
+    }
+
 
     // 6. Validate and Structure Data for Firestore
     // Perform basic validation on extractedData (add more checks as needed)
     let extractedData: Record<string, unknown> | null = null;
-    if (typeof parsedJsonResponse === "object" && parsedJsonResponse !== null) {
-      extractedData = parsedJsonResponse as Record<string, unknown>;
-    } else if (parsedJsonResponse !== null) {
+    if (typeof parsedExtractionJson === "object" && parsedExtractionJson !== null) {
+      extractedData = parsedExtractionJson as Record<string, unknown>;
+    } else if (parsedExtractionJson !== null) {
       // Log if the parsed JSON wasn't an object as expected
-      logger.warn("Parsed JSON response from Gemini was not an object.", {parsedJsonResponse});
+      logger.warn("Parsed JSON response from Gemini was not an object.", {parsedExtractionJson});
     }
-    const vendorName = extractedData?.vendorName as string | undefined;
+    const vendorName = parsedExtractionJson.vendorName as string | undefined;
     const dateString = extractedData?.transactionDate as string | undefined;
     const totalAmount = extractedData?.totalAmount as number | undefined;
     const currencyCode = extractedData?.currencyCode as string | undefined;
-    const lineItemsRaw = extractedData?.lineItems;
+    let lineItemsRaw = parsedExtractionJson.lineItems;
 
     // Convert date string to Timestamp, handle potential parsing errors
     let transactionTimestamp: Timestamp | null = null;
@@ -1612,33 +1802,200 @@ export const processReceiptImage = onCall(
     }
 
     // Validate and sanitize line items
-    let lineItems: { description: string; quantity: number; price: number; }[] = [];
+    let lineItems: { description: string; quantity: number; price: number; category?: string }[] = [];
     if (Array.isArray(lineItemsRaw)) {
       lineItems = lineItemsRaw
       // --- Use unknown and type checks inside map ---
         .map((item: unknown) => {
           let description = "N/A";
           let quantity = 1;
-          let price = 0;
+          let price = 0.0;
 
           // Check if item is an object before accessing properties
           if (typeof item === "object" && item !== null) {
+            // --- Safely access REQUIRED fields ---
             description = String((item as Record<string, unknown>)?.description ?? "N/A");
-            // Attempt to convert quantity, default to 1 if fails or not a number
+
             const rawQuantity = (item as Record<string, unknown>)?.quantity;
             quantity = typeof rawQuantity === "number" ? rawQuantity : (Number(rawQuantity ?? 1) || 1);
-            // Attempt to convert price, default to 0 if fails or not a number
+            // Ensure quantity is an integer if preferred, although number is fine
+            quantity = Number.isFinite(quantity) ? Math.round(quantity) : 1; // Round just in case, ensure finite
+            if (quantity <= 0) quantity = 1; // Ensure positive quantity
+
             const rawPrice = (item as Record<string, unknown>)?.price;
             price = typeof rawPrice === "number" ? rawPrice : (Number(rawPrice ?? 0) || 0);
+            price = Number.isFinite(price) ? price : 0.0; // Ensure finite price
+            // -------------------------------------
+
+            // NOTE: We IGNORE other fields like 'hatchery' here.
+            // We only extract what we explicitly look for.
+          } else {
+            logger.warn("Found non-object item in lineItems array:", {item});
+            // Return null or a default object to be filtered out later?
+            return null; // Mark for filtering
           }
 
           return {description, quantity, price};
         })
       // --------------------------------------------
-        .filter((item) => !isNaN(item.quantity) && !isNaN(item.price));
+        .filter((item): item is { description: string; quantity: number; price: number; category?: string } =>
+          item !== null && typeof item.description === "string" && !isNaN(item.quantity) && !isNaN(item.price)
+        );
+      logger.info(`Sanitized line items count: ${lineItems.length}`);
+    } else {
+      logger.warn("Parsed 'lineItems' was not an array or was missing.", {lineItemsRaw});
+      lineItemsRaw = []; // Ensure it's an empty array for the categorization step
+      lineItems = [];
     }
 
-    // --- Prepare Firestore Document ---
+    // --- 7. Categorize Line Items (NEW STEP) ---
+    logger.info(`Attempting to categorize ${lineItems.length} line items...`);
+    const categoryPromptTemplate = (itemDesc: string) => `
+        Classify the following purchased item into one of these categories.
+        Use subcategories where appropriate (e.g., "Groceries > Dairy").
+        If unsure, use a general category or "Uncategorized".
+
+        Categories:
+        - Groceries > Produce
+        - Groceries > Dairy
+        - Groceries > Meat
+        - Groceries > Pantry
+        - Groceries > Bakery
+        - Groceries > Deli
+        - Groceries > Frozen Foods
+        - Groceries > Snacks
+        - Groceries > Canned Goods
+        - Groceries > Condiments        
+        - Groceries > Baby Products
+        - Groceries > Pet Supplies
+        - Groceries > Health Foods
+        - Groceries > Beverages
+        - Groceries > Other
+        - Restaurants > Fast Food
+        - Restaurants > Dine-in
+        - Restaurants > Takeout
+        - Restaurants > Bar
+        - Restaurants > Food Truck
+        - Restaurants > Cafeteria
+        - Restaurants > Coffee Shop
+        - Transportation > Gas
+        - Transportation > Ride Share
+        - Transportation > Taxi
+        - Transportation > Parking Fees
+        - Transportation > Tolls
+        - Transportation > Car Wash
+        - Transportation > EV Charging
+        - Transportation > Vehicle Maintenance
+        - Transportation > Public Transit
+        - Shopping > Clothing
+        - Shopping > Electronics
+        - Shopping > Home Goods
+        - Shopping > Hardware
+        - Shopping > Furniture
+        - Shopping > Sporting Goods
+        - Shopping > Toys
+        - Shopping > Gifts
+        - Shopping > Office Supplies
+        - Shopping > Cleaning Supplies
+        - Shopping > Personal Care
+        - Shopping > Books
+        - Shopping > Beauty
+        - Shopping > Jewelry
+        - Shopping > Crafts
+        - Shopping > Garden
+        - Shopping > Automotive
+        - Shopping > Travel
+        - Shopping > Other
+        - Bills & Utilities > Rent/Mortgage
+        - Bills & Utilities > Internet
+        - Bills & Utilities > Phone
+        - Bills & Utilities > Electricity
+        - Bills & Utilities > Water
+        - Bills & Utilities > Natural Gas
+        - Bills & Utilities > Trash
+        - Bills & Utilities > Insurance
+        - Bills & Utilities > Property Taxes
+        - Bills & Utilities > Heating Oil
+        - Bills & Utilities > HOA Fees
+        - Entertainment > Movies
+        - Entertainment > Streaming Services
+        - Entertainment > Concerts
+        - Entertainment > Sports Events
+        - Entertainment > Amusement Parks
+        - Entertainment > Museums
+        - Entertainment > Video Games
+        - Health & Wellness > Pharmacy
+        - Health & Wellness > Doctor
+        - Health & Wellness > Dentist
+        - Health & Wellness > Gym
+        - Health & Wellness > Therapy
+        - Health & Wellness > Supplements
+        - Health & Wellness > Fitness Classes
+        - Health & Wellness > Spa
+        - Health & Wellness > Other
+        - Travel > Car Rental
+        - Travel > Train
+        - Travel > Bus
+        - Travel > Cruise
+        - Travel > Flights
+        - Travel > Hotels
+        - Personal Care
+        - Home Services > House Cleaning Service
+        - Home Services > Lawn Care
+        - Home Services > Home Repairs
+        - Home Services > Pest Control Service
+        - Home Services > Pool Maintenance
+        - Miscellaneous
+
+        Respond ONLY with a valid JSON object like: {"category": "Your Category > Your Subcategory"} or {"category": "Uncategorized"}
+
+        Item Description: "${itemDesc}"
+        JSON Response:
+        `;
+
+    // Process items sequentially to avoid overwhelming Gemini (can parallelize later)
+    for (let i = 0; i < lineItems.length; i++) {
+      const item = lineItems[i];
+      if (!item.description || item.description === "N/A") {
+        item.category = "Uncategorized"; // Assign default if no description
+        continue;
+      }
+      try {
+        const categoryPrompt = categoryPromptTemplate(item.description);
+        logger.info(`Categorizing item "${item.description}"...`);
+        const result = await textModel.generateContent(categoryPrompt); // Use text model
+        const response = result.response;
+        const responseText = response.text() ?? "";
+
+        if (responseText) {
+          const cleanedResponse = responseText.trim().replace(/^```json|```$/g, "").trim();
+          try {
+            const categoryJson = JSON.parse(cleanedResponse);
+            if (typeof categoryJson === "object" && categoryJson !== null && typeof categoryJson.category === "string") {
+              item.category = categoryJson.category; // Add category to the item object
+              logger.info(` -> Category: ${item.category}`);
+            } else {
+              logger.warn(`Invalid category JSON structure: ${cleanedResponse}`);
+              item.category = "Uncategorized";
+            }
+          } catch (parseError) {
+            logger.warn(`Failed to parse category JSON: ${cleanedResponse}`, {parseError});
+            item.category = "Uncategorized"; // Fallback category
+          }
+        } else {
+          logger.warn(`No category text returned for "${item.description}"`);
+          item.category = "Uncategorized";
+        }
+      } catch (catError: unknown) {
+        logger.error(`Error categorizing item "${item.description}"`, {catError});
+        item.category = "Uncategorized"; // Assign default category on error
+      }
+      // Optional: Add a small delay between API calls if hitting rate limits
+      // await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    logger.info("Line item categorization complete.");
+
+    // --- 8. Prepare Firestore Document
     const receiptDocData = {
       userId: userId,
       uploadTimestamp: Timestamp.now(), // When it was processed
@@ -1672,5 +2029,156 @@ export const processReceiptImage = onCall(
       logger.error(`processReceiptImage: Failed to save receipt data to Firestore for user ${userId}.`, {error: errorMessage});
       throw new HttpsError("internal", `Failed to save receipt data: ${errorMessage}`);
     }
+  }
+);
+
+// --- NEW: matchReceipt Function ---
+/**
+ * Attempts to match a processed receipt in Firestore with a transaction document.
+ */
+export const matchReceipt = onCall(
+  // Doesn't need Plaid/Gemini secrets directly, only Firestore access via Admin SDK
+  async (request) => {
+    // 1. Authentication Check
+    if (!request.auth) {
+      logger.error("matchReceipt: Authentication Error.");
+      throw new HttpsError("unauthenticated", "Function must be called while authenticated.");
+    }
+    const userId = request.auth.uid;
+
+    // 2. Validate Input Data
+    const receiptId = request.data.receiptId as string | undefined;
+    if (!receiptId) {
+      logger.error("matchReceipt: Invalid argument - receiptId missing.", {userId: userId, data: request.data});
+      throw new HttpsError("invalid-argument", "Missing 'receiptId' in request data.");
+    }
+    logger.info(`matchReceipt: Starting for user: ${userId}, receipt: ${receiptId}`);
+
+    // 3. Fetch Receipt Document
+    const receiptRef = db.collection("receipts").doc(receiptId);
+    let receiptData: admin.firestore.DocumentData | undefined;
+    try {
+      const receiptSnapshot = await receiptRef.get();
+      if (!receiptSnapshot.exists) {
+        logger.error(`matchReceipt: Receipt document ${receiptId} not found.`);
+        throw new HttpsError("not-found", `Receipt ${receiptId} not found.`);
+      }
+      receiptData = receiptSnapshot.data();
+      // Basic validation
+      if (!receiptData || receiptData.userId !== userId) {
+        logger.error(`matchReceipt: Receipt ${receiptId} does not belong to user ${userId} or data missing.`);
+        throw new HttpsError("permission-denied", "Receipt not found or access denied.");
+      }
+      if (receiptData.matchedTransactionId) {
+        logger.info(`matchReceipt: Receipt ${receiptId} is already matched to transaction ${receiptData.matchedTransactionId}. Skipping.`);
+        return {success: true, status: "already_matched", transactionId: receiptData.matchedTransactionId};
+      }
+      if (!receiptData.transactionDate || !(receiptData.transactionDate instanceof Timestamp) || typeof receiptData.totalAmount !== "number") {
+        logger.error(`matchReceipt: Receipt ${receiptId} is missing required fields (transactionDate, totalAmount) or has invalid types.`);
+        throw new HttpsError("failed-precondition", "Receipt data is incomplete or invalid for matching.");
+      }
+    } catch (error: unknown) {
+      if (error instanceof HttpsError) {
+        throw error;
+      } // Re-throw specific errors
+      logger.error(`matchReceipt: Failed to read receipt document ${receiptId}.`, {userId: userId, error});
+      throw new HttpsError("internal", "Failed to read receipt data.");
+    }
+
+    // 4. Define Matching Parameters
+    const receiptDate = (receiptData.transactionDate as Timestamp).toDate();
+    const receiptAmount = Math.abs(receiptData.totalAmount); // Use absolute amount for comparison
+    const dateToleranceDays = 2; // Look +/- 2 days around the receipt date
+    const amountTolerance = 0.05; // Allow 5% difference in amount (adjust as needed)
+
+    const startDate = Timestamp.fromDate(new Date(receiptDate.setDate(receiptDate.getDate() - dateToleranceDays)));
+    // Reset date for endDate calculation
+    receiptDate.setDate(receiptDate.getDate() + dateToleranceDays); // Go back to original day
+    const endDate = Timestamp.fromDate(new Date(receiptDate.setDate(receiptDate.getDate() + dateToleranceDays)));
+
+    const minAmount = Math.abs(receiptAmount * (1 - amountTolerance));
+    const maxAmount = Math.abs(receiptAmount * (1 + amountTolerance));
+
+    logger.info(`matchReceipt: Searching for transactions between ${startDate.toDate().toISOString()} and ${endDate.toDate().toISOString()}`);
+    logger.info(`matchReceipt: Amount range: ${minAmount.toFixed(2)} to ${maxAmount.toFixed(2)} (target: ${receiptAmount.toFixed(2)})`);
+
+    // 5. Query Potential Matching Transactions
+    let potentialMatches: admin.firestore.QueryDocumentSnapshot[] = [];
+    try {
+      // Query based on userId, date range, amount range, and ensure not already matched
+      const query = db.collection("transactions")
+        .where("userId", "==", userId)
+        .where("date", ">=", startDate)
+        .where("date", "<=", endDate)
+        // Firestore doesn't support range filtering on multiple fields directly.
+        // We fetch based on date and filter amount/match status in code.
+        // Index on userId + date will be needed.
+        .orderBy("date", "desc"); // Order to potentially prioritize closer dates
+
+      const querySnapshot = await query.get();
+
+      // Filter results further in code
+      potentialMatches = querySnapshot.docs.filter((doc) => {
+        const txData = doc.data();
+        const txAmount = Math.abs(txData.amount ?? 0);
+        const alreadyMatched = !!txData.linkedReceiptId; // Check if linkedReceiptId exists and is truthy
+
+        // Apply amount filter and check if already matched
+        return !alreadyMatched && txAmount >= minAmount && txAmount <= maxAmount;
+      });
+
+      logger.info(`matchReceipt: Found ${potentialMatches.length} potential transactions within date range and amount tolerance.`);
+    } catch (error: unknown) {
+      logger.error(`matchReceipt: Firestore query failed for user ${userId}, receipt ${receiptId}.`, {error});
+      // Check for index errors specifically
+      if (error instanceof Error && error.message.includes("requires an index")) {
+        logger.error("Firestore query requires an index (likely on userId and date). Please create it.");
+        throw new HttpsError("failed-precondition", "Database query needs optimization. Please try again later.");
+      }
+      throw new HttpsError("internal", "Failed to query transactions.");
+    }
+
+    // 6. Select Best Match (or handle ambiguity)
+    let bestMatchId: string | null = null;
+
+    if (potentialMatches.length === 0) {
+      logger.info(`matchReceipt: No suitable unmatched transactions found for receipt ${receiptId}.`);
+      return {success: true, status: "no_match_found"};
+    } else if (potentialMatches.length === 1) {
+      // Only one match, assume it's correct
+      bestMatchId = potentialMatches[0].id;
+      logger.info(`matchReceipt: Found unique potential match: ${bestMatchId} for receipt ${receiptId}.`);
+    } else {
+      // Multiple potential matches - requires more sophisticated logic or user intervention
+      // For V1, we will log and not match automatically.
+      const potentialIds = potentialMatches.map((doc) => doc.id);
+      logger.warn(`matchReceipt: Found multiple (${potentialMatches.length}) potential matches for receipt ${receiptId}.
+         Requires disambiguation.`, {potentialIds});
+      // TODO: Future: Implement scoring based on amount difference, merchant name similarity?
+      // TODO: Future: Flag receipt for manual matching via UI?
+      return {success: true, status: "multiple_matches_found", potentialIds: potentialIds};
+    }
+
+    // 7. Link Receipt and Transaction in Firestore (if unique match found)
+    if (bestMatchId) {
+      const transactionRef = db.collection("transactions").doc(bestMatchId);
+      try {
+        logger.info(`matchReceipt: Attempting to link receipt ${receiptId} and transaction ${bestMatchId}...`);
+        // Use a batch write to update both documents atomically
+        const batch = db.batch();
+        batch.update(receiptRef, {matchedTransactionId: bestMatchId, status: "matched"});
+        batch.update(transactionRef, {linkedReceiptId: receiptId});
+        await batch.commit();
+        logger.info(`matchReceipt: Successfully linked receipt ${receiptId} and transaction ${bestMatchId}.`);
+        return {success: true, status: "matched", transactionId: bestMatchId};
+      } catch (error: unknown) {
+        logger.error(`matchReceipt: Firestore batch update failed when linking receipt ${receiptId} and transaction ${bestMatchId}.`, {error});
+        throw new HttpsError("internal", "Failed to link receipt and transaction.");
+      }
+    }
+
+    // Should not be reached if logic is correct, but included as fallback
+    logger.warn("matchReceipt: Reached end of function unexpectedly.");
+    return {success: false, status: "unexpected_state"};
   }
 );

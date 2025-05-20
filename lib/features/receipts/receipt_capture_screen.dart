@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart'; // Camera package
 import 'package:image_picker/image_picker.dart'; // Image picker
 import 'package:permission_handler/permission_handler.dart'; // Permissions
+import 'dart:convert'; // For base64Encode
+import 'dart:typed_data'; // For Uint8List
+import 'package:cloud_functions/cloud_functions.dart';
 
 class ReceiptCaptureScreen extends StatefulWidget {
   const ReceiptCaptureScreen({super.key});
@@ -150,27 +153,63 @@ class _ReceiptCaptureScreenState extends State<ReceiptCaptureScreen> {
      if (_imageFile == null || _isProcessing) return;
 
       setState(() => _isProcessing = true);
+      _errorMessage = null; // Clear previous errors
       print("Submitting image: ${_imageFile!.path}");
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Processing receipt... (Placeholder)')),
-      );
 
-      // TODO: Implement actual submission logic:
-      // 1. Read image file as bytes or base64 string.
-      // 2. Call a Cloud Function (e.g., 'processReceiptImage').
-      //    - Pass image data (e.g., base64 string).
-      //    - Handle response (success/failure).
-      // 3. On success, maybe navigate back or show confirmation.
+      final scaffoldMessenger = ScaffoldMessenger.of(context); // Capture context
 
-      // --- Placeholder Delay ---
-      await Future.delayed(const Duration(seconds: 2));
-      // -----------------------
+      try {
+        // 1. Read image bytes
+        final Uint8List imageBytes = await _imageFile!.readAsBytes();
 
-      if (mounted) {
-        setState(() => _isProcessing = false);
-        // Optionally clear image or navigate back after processing
-        // setState(() => _imageFile = null);
-        // Navigator.pop(context);
+        // 2. Encode to Base64
+        final String base64String = base64Encode(imageBytes);
+
+        // 3. Call Cloud Function
+        print("Calling processReceiptImage Cloud Function...");
+        final functions = FirebaseFunctions.instance;
+        final callable = functions.httpsCallable(
+            'processReceiptImage',
+             // Optional: Increase timeout on client if needed, but backend timeout is usually dominant
+             // options: HttpsCallableOptions(timeout: const Duration(seconds: 120)),
+        );
+        final results = await callable.call(<String, dynamic>{
+          'imageDataBase64': base64String,
+        });
+
+        // 4. Handle response
+        if (results.data['success'] == true) {
+            final receiptId = results.data['receiptId'];
+            print('Successfully processed receipt. Firestore ID: $receiptId');
+            scaffoldMessenger.showSnackBar(
+               SnackBar(content: Text('Receipt processed successfully (ID: $receiptId)')),
+            );
+            // Optionally navigate back or clear image
+            if (mounted) {
+               setState(() => _imageFile = null); // Clear image preview
+               // Consider Navigator.pop(context); // Go back automatically?
+            }
+        } else {
+            throw Exception(results.data['message'] ?? 'Backend indicated failure during receipt processing.');
+        }
+
+      } on FirebaseFunctionsException catch (e) {
+        print("FirebaseFunctionsException calling processReceiptImage: ${e.code} - ${e.message} - Details: ${e.details}");
+        _errorMessage = 'Error processing receipt: ${e.message ?? e.code}';
+        scaffoldMessenger.showSnackBar(
+           SnackBar(content: Text(_errorMessage!)),
+        );
+      } catch (e) {
+         print("Error submitting image: $e");
+         _errorMessage = 'An unexpected error occurred: ${e.toString()}';
+          scaffoldMessenger.showSnackBar(
+           SnackBar(content: Text(_errorMessage!)),
+         );
+      } finally {
+        // Ensure processing state is reset
+         if (mounted) {
+           setState(() => _isProcessing = false);
+         }
       }
   }
 

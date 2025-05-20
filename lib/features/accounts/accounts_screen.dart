@@ -582,6 +582,52 @@ class _AccountsScreenState extends State<AccountsScreen> {
                       ),
                     ),
 
+                    const Divider(),
+
+                    // --- TEMPORARY MATCH TEST BUTTON ---
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                      child: OutlinedButton(
+                        child: const Text("DEBUG: Test Match Receipt"),
+                        onPressed: () async {
+                          const receiptIdToTest = "6KVF5hk34Q52k3nrY6qc"; // <-- PASTE A REAL RECEIPT ID FROM FIRESTORE
+                          if (receiptIdToTest == "YOUR_RECEIPT_ID_HERE") {
+                            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please paste a real receipt ID in accounts_screen.dart!')));
+                            return;
+                          }
+                          // Prevent running if Plaid link is happening
+                          if (_isPlaidLoading) return;
+
+                          print("Calling matchReceipt for ID: $receiptIdToTest");
+                          final scaffoldMessenger = ScaffoldMessenger.of(context);
+                          scaffoldMessenger.showSnackBar(const SnackBar(content: Text('Attempting receipt match...')));
+
+                          try {
+                            final functions = FirebaseFunctions.instance;
+                            final callable = functions.httpsCallable('matchReceipt');
+                            final results = await callable.call({'receiptId': receiptIdToTest});
+                            print("matchReceipt Result: ${results.data}");
+                            scaffoldMessenger.hideCurrentSnackBar();
+                            scaffoldMessenger.showSnackBar(
+                                SnackBar(content: Text('Match result: ${results.data['status'] ?? 'Unknown'}'))
+                            );
+                          } on FirebaseFunctionsException catch (e) {
+                            print("Error calling matchReceipt (Firebase): ${e.code} - ${e.message}");
+                            scaffoldMessenger.hideCurrentSnackBar();
+                            scaffoldMessenger.showSnackBar(
+                              SnackBar(content: Text('Error matching receipt: ${e.message ?? e.code}'))
+                            );
+                          } catch (e) {
+                            print("Error calling matchReceipt (General): $e");
+                            scaffoldMessenger.hideCurrentSnackBar();
+                            scaffoldMessenger.showSnackBar(
+                              SnackBar(content: Text('Error matching receipt: ${e.toString()}'))
+                            );
+                          }
+                        },
+                      ),
+                    ),
+
                     const Divider(), // Separator
 
                     // --- List of Accounts ---
