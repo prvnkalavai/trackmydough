@@ -2182,3 +2182,202 @@ export const matchReceipt = onCall(
     return {success: false, status: "unexpected_state"};
   }
 );
+
+// Helper function for date range calculation
+function getDateRangeForSankey(
+  period: string,
+  offset: number = 0,
+  nowOverride?: Date
+): { startDate: admin.firestore.Timestamp; endDate: admin.firestore.Timestamp } | null {
+  const now = nowOverride ? new Date(nowOverride.getTime()) : new Date();
+  let CDate = new Date(now.getTime()); // Clone 'now' to avoid modifying it directly initially
+
+  let year: number;
+  let month: number; // 0-11 for month
+
+  switch (period.toLowerCase()) {
+    case "monthly":
+      CDate = new Date(now.getFullYear(), now.getMonth(), 1); // Start with the 1st of the current month
+      CDate.setMonth(CDate.getMonth() + offset);
+      year = CDate.getFullYear();
+      month = CDate.getMonth();
+      break;
+    case "yearly":
+      CDate = new Date(now.getFullYear(), 0, 1); // Start with Jan 1st of the current year
+      CDate.setFullYear(CDate.getFullYear() + offset);
+      year = CDate.getFullYear();
+      month = 0; // Not directly used for yearly start/end but consistent
+      break;
+    case "yeartodate": // Changed from "yeartodate" to "yearToDate" to match frontend
+      if (offset !== 0) {
+        logger.warn("getDateRangeForSankey: offset is ignored for 'yearToDate'", { period, offset });
+      }
+      year = now.getFullYear();
+      month = 0;
+      break;
+    default:
+      logger.error("getDateRangeForSankey: Invalid period provided.", { period });
+      return null;
+  }
+
+  let startDateBoundary: Date;
+  let endDateBoundary: Date;
+
+  switch (period.toLowerCase()) {
+    case "monthly":
+      startDateBoundary = new Date(year, month, 1, 0, 0, 0, 0);
+      endDateBoundary = new Date(year, month + 1, 0, 23, 59, 59, 999); // Day 0 of next month is last day of current
+      break;
+    case "yearly":
+      startDateBoundary = new Date(year, 0, 1, 0, 0, 0, 0);
+      endDateBoundary = new Date(year, 11, 31, 23, 59, 59, 999);
+      break;
+    case "yeartodate": // Changed from "yeartodate" to "yearToDate"
+      startDateBoundary = new Date(year, 0, 1, 0, 0, 0, 0);
+      // endDate for YTD is the 'now' at the moment function is called, up to end of that day
+      const ytdEndDate = nowOverride ? new Date(nowOverride.getTime()) : new Date();
+      endDateBoundary = new Date(ytdEndDate.getFullYear(), ytdEndDate.getMonth(), ytdEndDate.getDate(), 23, 59, 59, 999);
+      break;
+    default:
+      return null; // Should be caught by first switch
+  }
+
+  return {
+    startDate: admin.firestore.Timestamp.fromDate(startDateBoundary),
+    endDate: admin.firestore.Timestamp.fromDate(endDateBoundary),
+  };
+}
+
+export const getSankeyData = onCall(async (request) => {
+  logger.info("getSankeyData function invoked.", { uid: request.auth?.uid, data: request.data });
+
+  if (!request.auth) {
+    logger.error("Authentication error: User is not authenticated.", { functionName: "getSankeyData" });
+    throw new HttpsError("unauthenticated", "The function must be called while authenticated.");
+  }
+  const userId = request.auth.uid;
+
+  const { period, dateOffset = 0 } = request.data as { period: string; dateOffset?: number };
+
+  if (!period || !["monthly", "yearToDate", "yearly"].includes(period)) {
+    logger.error("Invalid 'period' parameter.", { userId, requestData: request.data });
+    throw new HttpsError("invalid-argument", "Invalid 'period' specified. Must be 'monthly', 'yearToDate', or 'yearly'.");
+  }
+  if (typeof dateOffset !== 'number' || isNaN(dateOffset)) {
+      logger.error("Invalid 'dateOffset' parameter. Must be a number.", { userId, requestData: request.data });
+      throw new HttpsError("invalid-argument", "Invalid 'dateOffset' specified. Must be a number.");
+  }
+
+  try {
+    const dateRange = getDateRangeForSankey(period, dateOffset);
+    if (!dateRange) {
+      logger.error("Failed to calculate date range, likely invalid period.", { userId, period, dateOffset });
+      throw new HttpsError("invalid-argument", "Invalid period or dateOffset resulting in date range calculation failure.");
+    }
+
+    logger.info(`Calculated date range for user ${userId}: ${dateRange.startDate.toDate().toISOString()} to ${dateRange.endDate.toDate().toISOString()}`, { period, dateOffset });
+
+    const db = admin.firestore(); // Ensure db is initialized
+    let transactionsSnapshot;
+    try {
+      transactionsSnapshot = await db.collection("transactions")
+        .where("userId", "==", userId)
+        .where("date", ">=", dateRange.startDate)
+        .where("date", "<=", dateRange.endDate)
+        .get();
+    } catch (error) {
+      logger.error("Firestore error while fetching transactions:", { userId, period, dateOffset, error });
+      throw new HttpsError("internal", "An error occurred while fetching your financial data.");
+    }
+
+    const fetchedTransactions: FirebaseFirestore.DocumentData[] = [];
+    transactionsSnapshot.forEach(doc => {
+      fetchedTransactions.push(doc.data());
+    });
+    logger.info(`Fetched ${fetchedTransactions.length} transactions for user ${userId}.`);
+
+    let totalIncome = 0;
+    let totalExpenses = 0;
+    const incomeSources: { [key: string]: number } = {};
+    const expenseCategories: { [key: string]: number } = {};
+
+    if (fetchedTransactions.length > 0) {
+      for (const tx of fetchedTransactions) {
+        const amount = tx.amount as number;
+        const categories = tx.category as string[] || [];
+
+        if (typeof amount !== 'number' || isNaN(amount)) {
+          logger.warn("Skipping transaction with invalid amount:", { userId, transactionId: tx.plaidTransactionId || 'N/A', amount });
+          continue;
+        }
+
+        if (amount < 0) { // Income
+          const incomeAmount = Math.abs(amount);
+          totalIncome += incomeAmount;
+          const incomeSourceName = "Income"; // V1: Single income source
+          incomeSources[incomeSourceName] = (incomeSources[incomeSourceName] || 0) + incomeAmount;
+        } else if (amount > 0) { // Expense
+          const expenseAmount = amount;
+          totalExpenses += expenseAmount;
+          const primaryCategory = categories[0] || "Uncategorized";
+          expenseCategories[primaryCategory] = (expenseCategories[primaryCategory] || 0) + expenseAmount;
+        }
+      }
+    }
+     const savingsBuffer = totalIncome - totalExpenses;
+    logger.info("Data aggregation complete.", { userId, totalIncome, totalExpenses, savingsBuffer });
+
+    const sankeyLinks: Array<{ from: string; to: string; value: number }> = [];
+
+    if (totalIncome > 0) {
+      for (const sourceName in incomeSources) {
+        if (incomeSources.hasOwnProperty(sourceName) && incomeSources[sourceName] > 0) {
+          sankeyLinks.push({ from: sourceName, to: "Total Income", value: incomeSources[sourceName] });
+        }
+      }
+    } else if (Object.keys(incomeSources).length > 0 && totalIncome === 0) {
+        for (const sourceName in incomeSources) {
+            if (incomeSources.hasOwnProperty(sourceName)) {
+                 sankeyLinks.push({ from: sourceName, to: "Total Income", value: 0 });
+            }
+        }
+    }
+    
+    if (totalIncome > 0 || totalExpenses > 0) { // Links from "Total Income" to expense categories
+        for (const categoryName in expenseCategories) {
+            if (expenseCategories.hasOwnProperty(categoryName) && expenseCategories[categoryName] > 0) {
+                sankeyLinks.push({ from: "Total Income", to: categoryName, value: expenseCategories[categoryName] });
+            }
+        }
+    }
+
+    if (savingsBuffer > 0 && totalIncome > 0) {
+      sankeyLinks.push({ from: "Total Income", to: "Savings/Buffer", value: savingsBuffer });
+    }
+
+    logger.info("Formatted Sankey links.", { userId, linksCount: sankeyLinks.length });
+
+    return {
+      links: sankeyLinks,
+      totalIncome: totalIncome,
+      totalExpenses: totalExpenses,
+      savingsBuffer: savingsBuffer,
+    };
+
+  } catch (error: any) { // Changed from 'any' to 'unknown' for stricter typing, then cast
+    if (error instanceof HttpsError) {
+      logger.warn(`Caught HttpsError in getSankeyData: ${error.code} - ${error.message}`, { userId: request.auth?.uid, details: error.details });
+      throw error;
+    }
+    logger.error("Unexpected error in getSankeyData:", {
+      userId: request.auth?.uid,
+      requestData: request.data, // Be cautious if data can be very large or sensitive
+      errorObject: error, // Log the actual error object
+      errorMessage: error.message, // error.message might not exist if 'error' is not Error instance
+      errorStack: error.stack // error.stack might not exist
+    });
+    // Provide a generic error message to the client
+    throw new HttpsError("internal", "An unexpected error occurred while processing your Sankey data.");
+  }
+});
+
