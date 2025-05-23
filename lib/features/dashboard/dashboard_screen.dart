@@ -21,11 +21,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   double? _totalExpenses;
   double? _savingsBuffer;
 
-  // Sunburst chart specific state variables
-  List<Map<String, dynamic>>? _sunburstData;
-  double? _sunburstTotalExpenses;
-  bool _isSunburstLoading = false;
-  String? _sunburstErrorMessage;
+  // Doughnut chart specific state variables for category expenses
+  List<Map<String, dynamic>>? _categoryExpenseData;
+  double? _totalCategorizedExpensesFromCloud;
+  bool _isCategoryExpenseLoading = false;
+  String? _categoryExpenseErrorMessage;
 
   final FirebaseFunctions _functions = FirebaseFunctions.instance;
 
@@ -33,7 +33,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void initState() {
     super.initState();
     _fetchSankeyData();
-    _fetchSunburstData(); // Call to fetch sunburst data
+    _fetchCategoryExpenseData(); // Call to fetch category expense data
   }
 
   Future<void> _fetchSankeyData() async {
@@ -92,14 +92,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  Future<void> _fetchSunburstData() async {
+  Future<void> _fetchCategoryExpenseData() async {
     setState(() {
-      _isSunburstLoading = true;
-      _sunburstErrorMessage = null;
+      _isCategoryExpenseLoading = true;
+      _categoryExpenseErrorMessage = null;
     });
 
     try {
-      final HttpsCallable callable = _functions.httpsCallable('getSunburstData');
+      final HttpsCallable callable = _functions.httpsCallable('getSunburstData'); // Backend function name remains getSunburstData
       final HttpsCallableResult result = await callable.call(<String, dynamic>{
         'period': _selectedPeriod,
         'dateOffset': _dateOffset,
@@ -107,49 +107,45 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       if (result.data != null) {
         final Map<String, dynamic> responseData = result.data as Map<String, dynamic>;
-        // Adapt to the new structure where 'sunburstData' is the root node
-        final Map<String, dynamic>? sunburstChartDataRoot = responseData['sunburstData'] as Map<String, dynamic>?;
+        
+        // Access 'categories' and 'totalCategorizedExpenses' directly from responseData
+        final List<dynamic>? categoriesData = responseData['categories'] as List<dynamic>?;
+        final num? totalExpensesNum = responseData['totalCategorizedExpenses'] as num?;
 
-        if (sunburstChartDataRoot != null && sunburstChartDataRoot['children'] != null) {
-          final List<dynamic> childrenData = sunburstChartDataRoot['children'] as List<dynamic>;
+        if (categoriesData != null) {
           setState(() {
-            _sunburstData = childrenData.map((item) => item as Map<String, dynamic>).toList();
-            // Calculate total expenses from the sum of children's values
-            _sunburstTotalExpenses = childrenData.fold(0.0, (sum, item) {
-              final num value = item['value'] as num? ?? 0.0;
-              return sum + value.toDouble();
-            });
-            // If the root node itself has a 'value' (e.g. "Total Expenses"), we could use that too.
-            // For now, summing children is robust.
+            _categoryExpenseData = categoriesData.map((item) => item as Map<String, dynamic>).toList();
+            _totalCategorizedExpensesFromCloud = totalExpensesNum?.toDouble();
           });
         } else {
-          // Handle cases where 'sunburstData' or its 'children' are missing
+          // Handle cases where 'categories' is missing
           setState(() {
-            _sunburstData = null;
-            _sunburstTotalExpenses = null;
+            _categoryExpenseData = null;
+            _totalCategorizedExpensesFromCloud = null;
           });
         }
       } else {
+        // Handle case where result.data is null
         setState(() {
-          _sunburstData = null;
-          _sunburstTotalExpenses = null;
+          _categoryExpenseData = null;
+          _totalCategorizedExpensesFromCloud = null;
         });
       }
     } on FirebaseFunctionsException catch (e) {
       setState(() {
-        _sunburstErrorMessage = e.message ?? "An unknown error occurred while fetching Sunburst data.";
-        _sunburstData = null;
-        _sunburstTotalExpenses = null;
+        _categoryExpenseErrorMessage = e.message ?? "An unknown error occurred while fetching category expense data.";
+        _categoryExpenseData = null;
+        _totalCategorizedExpensesFromCloud = null;
       });
     } catch (e) {
       setState(() {
-        _sunburstErrorMessage = "An unexpected error occurred: $e";
-        _sunburstData = null;
-        _sunburstTotalExpenses = null;
+        _categoryExpenseErrorMessage = "An unexpected error occurred: $e";
+        _categoryExpenseData = null;
+        _totalCategorizedExpensesFromCloud = null;
       });
     } finally {
       setState(() {
-        _isSunburstLoading = false;
+        _isCategoryExpenseLoading = false;
       });
     }
   }
@@ -177,7 +173,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         _dateOffset = 0; // Reset offset when changing period type
                       });
                       _fetchSankeyData();
-                      _fetchSunburstData(); // Also fetch sunburst data
+                      _fetchCategoryExpenseData(); 
+                      _fetchCategoryExpenseData();
+                      _fetchCategoryExpenseData();
                     }
                   },
                 ),
@@ -286,11 +284,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (_isSunburstLoading)
+                if (_isCategoryExpenseLoading)
                   const Center(child: CircularProgressIndicator())
-                else if (_sunburstErrorMessage != null)
-                  Center(child: Text('Sunburst Error: $_sunburstErrorMessage'))
-                else if (_sunburstData != null && _sunburstData!.isNotEmpty)
+                else if (_categoryExpenseErrorMessage != null)
+                  Center(child: Text('Category Expense Error: $_categoryExpenseErrorMessage'))
+                else if (_categoryExpenseData != null && _categoryExpenseData!.isNotEmpty)
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -303,14 +301,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         height: 350, // Keep or adjust height as needed
                         child: SfCircularChart(
                           title: ChartTitle(
-                              text: 'Spending Breakdown ${(_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) ? "\nTotal: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_sunburstTotalExpenses)}" : ""}',
+                              text: 'Spending Breakdown ${(_totalCategorizedExpensesFromCloud != null && _totalCategorizedExpensesFromCloud! > 0) ? "\nTotal: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_totalCategorizedExpensesFromCloud)}" : ""}',
                               textStyle: Theme.of(context).textTheme.titleMedium,
                               alignment: ChartAlignment.center
                           ),
                           legend: Legend(isVisible: true, overflowMode: LegendItemOverflowMode.wrap),
                           series: <CircularSeries<Map<String, dynamic>, String>>[
                             DoughnutSeries<Map<String, dynamic>, String>(
-                              dataSource: _sunburstData,
+                              dataSource: _categoryExpenseData,
                               xValueMapper: (Map<String, dynamic> data, _) => data['name'] as String,
                               yValueMapper: (Map<String, dynamic> data, _) => data['value'] as num,
                               dataLabelSettings: DataLabelSettings(
@@ -321,8 +319,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 builder: (dynamic data, dynamic point, dynamic series, int pointIndex, int seriesIndex) {
                                   final num value = data['value'] as num;
                                   final String name = data['name'] as String;
-                                  if (_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0 && value > 0) {
-                                    final double percentage = (value / _sunburstTotalExpenses!) * 100;
+                                  if (_totalCategorizedExpensesFromCloud != null && _totalCategorizedExpensesFromCloud! > 0 && value > 0) {
+                                    final double percentage = (value / _totalCategorizedExpensesFromCloud!) * 100;
                                     if (percentage < 3) return null; // Hide label for very small segments
                                     return Text('${name}\n(${percentage.toStringAsFixed(1)}%)', style: const TextStyle(fontSize: 9, color: Colors.black87));
                                   }
