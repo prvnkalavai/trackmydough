@@ -51,8 +51,8 @@ dependencies:
   path_provider: ^2.1.5
   path: ^1.9.0
   permission_handler: ^12.0.0
-  syncfusion_flutter_charts: ^29.2.4
-  sankey_flutter: ^0.0.3
+  syncfusion_flutter_charts: 29.1.38
+  sankey_flutter: ^0.0.2
 
 dev_dependencies:
   flutter_test:
