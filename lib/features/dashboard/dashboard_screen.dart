@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_functions/cloud_functions.dart';
-import 'package:syncfusion_flutter_charts/charts.dart';
+import 'package:syncfusion_flutter_charts/charts.dart'; // Keep for Sunburst
+import 'package:sankey_flutter/sankey_flutter.dart'; // Import for new Sankey
 import 'package:intl/intl.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -223,38 +224,47 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         ? const Center(child: Text('No data available for the selected period.'))
                         : Padding(
                             padding: const EdgeInsets.all(16.0),
-                            child: SfSankey(
-                              title: SankeyTitle(text: 'Financial Flow Analysis'),
-                              links: _sankeyLinksData.map((linkData) => SankeyLink(
-                                source: linkData['from']!,
-                                target: linkData['to']!,
-                                value: (linkData['value'] as num).toDouble(),
-                              )).toList(),
-                              nodeStyle: SankeyNodeStyle(
-                                color: Colors.teal.withOpacity(0.7),
-                                borderColor: Colors.black54,
-                                borderWidth: 0.5,
-                                labelStyle: const TextStyle(fontSize: 11, color: Colors.black87, fontWeight: FontWeight.w500),
-                              ),
-                              linkStyle: SankeyLinkStyle(
-                                colorMode: SankeyLinkColorMode.target, // Color links based on target node
-                                color: Colors.blueGrey.withOpacity(0.4), // Default, might be overridden by colorMode
-                                // activeColor: Colors.deepPurpleAccent, // Color on interaction
-                              ),
-                              dataLabelSettings: SankeyDataLabelSettings(
-                                isVisible: true,
-                                labelPosition: SankeyLabelPosition.center, // Adjust as needed
-                                textStyle: const TextStyle(fontSize: 9, color: Colors.black),
-                                builder: (BuildContext context, SankeyLinkDetails details, SankeyDataLabelRenderDetails renderDetails) {
-                                  final value = renderDetails.value;
-                                  final formattedValue = NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(value);
-                                  return Text(formattedValue, style: const TextStyle(fontSize: 9, color: Colors.black));
+                            child: LayoutBuilder( // Use LayoutBuilder to get constraints for SankeyChart
+                              builder: (context, constraints) {
+                                // Data Transformation Logic
+                                final Set<String> nodeNamesSet = {};
+                                for (var link in _sankeyLinksData) {
+                                  nodeNamesSet.add(link['from'] as String);
+                                  nodeNamesSet.add(link['to'] as String);
                                 }
-                              ),
-                              tooltipSettings: SankeyTooltipSettings(
-                                enable: true,
-                                textStyle: const TextStyle(fontSize: 10),
-                              ),
+                                final List<String> uniqueNodeNames = nodeNamesSet.toList();
+
+                                final List<SankeyNodeInfo> nodes = uniqueNodeNames
+                                    .map((name) => SankeyNodeInfo(label: name))
+                                    .toList();
+
+                                final List<SankeyLinkInfo> links = _sankeyLinksData.map((linkData) {
+                                  final String fromNodeName = linkData['from'] as String;
+                                  final String toNodeName = linkData['to'] as String;
+                                  final double value = (linkData['value'] as num).toDouble();
+                                  
+                                  final int sourceId = uniqueNodeNames.indexOf(fromNodeName);
+                                  final int targetId = uniqueNodeNames.indexOf(toNodeName);
+
+                                  return SankeyLinkInfo(
+                                    sourceId: sourceId,
+                                    targetId: targetId,
+                                    value: value,
+                                  );
+                                }).toList();
+
+                                return SankeyChart(
+                                  links: links,
+                                  nodes: nodes,
+                                  nodeWidth: 12.0, // Example styling
+                                  nodeColor: Colors.blue.shade300, // Example styling
+                                  linkColor: Colors.grey.shade300, // Example styling
+                                  // labelStyle: TextStyle(fontSize: 10, color: Colors.black), // If available
+                                  // showLabels: true, // If available for node labels
+                                  height: constraints.maxHeight, 
+                                  width: constraints.maxWidth,
+                                );
+                              }
                             ),
                           ),
           ),
@@ -284,65 +294,58 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'Spending Breakdown ${(_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) ? "- Total: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_sunburstTotalExpenses)} " : ""}',
-                        style: Theme.of(context).textTheme.titleLarge,
-                      ),
-                      const SizedBox(height: 8),
+                      // Text( // Title is now part of SfCircularChart
+                      //   'Spending Breakdown ${(_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) ? "- Total: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_sunburstTotalExpenses)} " : ""}',
+                      //   style: Theme.of(context).textTheme.titleLarge,
+                      // ),
+                      // const SizedBox(height: 8), // Adjust spacing if needed
                       SizedBox(
-                        height: 350, // Increased height for better visualization
-                        child: SfSunburstChart(
-                          dataSource: _sunburstData!,
-                          xValueMapper: (dynamic data, _) => data['name'] as String,
-                          yValueMapper: (dynamic data, _) => data['value'] as num,
-                          childItemsPath: 'children',
-                          palette: const <Color>[ // Added color palette
-                            Colors.blue, Colors.green, Colors.orange, Colors.red, Colors.purple,
-                            Colors.brown, Colors.pink, Colors.teal, Colors.indigo, Colors.cyan,
-                            Colors.lime, Colors.amber,
+                        height: 350, // Keep or adjust height as needed
+                        child: SfCircularChart(
+                          title: ChartTitle(
+                              text: 'Spending Breakdown ${(_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) ? "\nTotal: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_sunburstTotalExpenses)}" : ""}',
+                              textStyle: Theme.of(context).textTheme.titleMedium,
+                              alignment: ChartAlignment.center
+                          ),
+                          legend: Legend(isVisible: true, overflowMode: LegendItemOverflowMode.wrap),
+                          series: <CircularSeries<Map<String, dynamic>, String>>[
+                            DoughnutSeries<Map<String, dynamic>, String>(
+                              dataSource: _sunburstData,
+                              xValueMapper: (Map<String, dynamic> data, _) => data['name'] as String,
+                              yValueMapper: (Map<String, dynamic> data, _) => data['value'] as num,
+                              dataLabelSettings: DataLabelSettings(
+                                isVisible: true,
+                                labelPosition: CircularLabelPosition.outside,
+                                labelIntersectAction: LabelIntersectAction.shift,
+                                connectorLineSettings: const ConnectorLineSettings(type: ConnectorType.line, length: '10%'),
+                                builder: (dynamic data, dynamic point, dynamic series, int pointIndex, int seriesIndex) {
+                                  final num value = data['value'] as num;
+                                  final String name = data['name'] as String;
+                                  if (_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0 && value > 0) {
+                                    final double percentage = (value / _sunburstTotalExpenses!) * 100;
+                                    if (percentage < 3) return null; // Hide label for very small segments
+                                    return Text('${name}\n(${percentage.toStringAsFixed(1)}%)', style: const TextStyle(fontSize: 9, color: Colors.black87));
+                                  }
+                                  return Text(name, style: const TextStyle(fontSize: 9, color: Colors.black87)); // Fallback
+                                }
+                              ),
+                              tooltipSettings: const TooltipSettings(enable: true, format: 'point.x: \$point.y'), // Updated format
+                              innerRadius: '40%',
+                              explode: true,
+                              explodeIndex: 0, // Explode the first segment
+                              palette: const <Color>[ // Example palette
+                                Colors.blue, Colors.green, Colors.orange, Colors.red, Colors.purple,
+                                Colors.brown, Colors.pink, Colors.teal, Colors.indigo, Colors.cyan,
+                                Colors.lime, Colors.amber,
+                              ],
+                            ),
                           ],
-                          radius: '95%', // Overall radius
-                          innerRadius: '30%', // Creates a donut hole
-                          dataLabelSettings: SunburstDataLabelSettings(
-                            isVisible: true,
-                            labelPosition: SunburstLabelPosition.circular,
-                            labelRotationMode: SunburstLabelRotationMode.angle,
-                            labelFormatter: (SunburstArgs args) {
-                              final String name = args.text ?? (args.dataPoint?['name'] as String? ?? '');
-                              if (_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0 && args.value != null) {
-                                final double percentage = (args.value! / _sunburstTotalExpenses!) * 100;
-                                if (percentage < 2) return ''; // Hide label for very small segments
-                                return '${name}\n(${percentage.toStringAsFixed(1)}%)';
-                              }
-                              return name;
-                            },
-                            textStyle: const TextStyle(fontSize: 9, color: Colors.black87, fontWeight: FontWeight.w500),
-                          ),
-                          tooltipSettings: SunburstTooltipSettings(
-                            enable: true,
-                            tooltipFormatter: (SunburstArgs args) {
-                              final String name = args.text ?? (args.dataPoint?['name'] as String? ?? '');
-                              final double value = args.value ?? 0;
-                              if (_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) {
-                                final double percentage = (value / _sunburstTotalExpenses!) * 100;
-                                return '$name: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(value)} (${percentage.toStringAsFixed(1)}%)';
-                              }
-                              return '$name: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(value)}';
-                            }
-                          ),
-                          selectionSettings: SunburstSelectionSettings( // Added selection settings
-                            enable: true,
-                            mode: SunburstSelectionMode.point, // PointSelectionMode is for SfCartesianChart, Sunburst uses SunburstSelectionMode
-                            selectedColor: Colors.orangeAccent.shade700,
-                            selectedOpacity: 0.9,
-                            unselectedOpacity: 0.5,
-                          ),
                         ),
                       ),
                     ],
                   )
                 else
-                  const Center(child: Text('No spending data for Sunburst chart for the selected period.')),
+                  const Center(child: Text('No spending data for Doughnut chart for the selected period.')),
               ],
             ),
           ),
