@@ -105,16 +105,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
       });
 
       if (result.data != null) {
-        final Map<String, dynamic> data = result.data as Map<String, dynamic>;
-        final List<dynamic>? hierarchicalData = data['hierarchicalData'] as List<dynamic>?;
-        final num? totalExpensesNum = data['totalExpenses'] as num?;
+        final Map<String, dynamic> responseData = result.data as Map<String, dynamic>;
+        // Adapt to the new structure where 'sunburstData' is the root node
+        final Map<String, dynamic>? sunburstChartDataRoot = responseData['sunburstData'] as Map<String, dynamic>?;
 
-        setState(() {
-          _sunburstData = hierarchicalData
-              ?.map((item) => item as Map<String, dynamic>)
-              .toList();
-          _sunburstTotalExpenses = totalExpensesNum?.toDouble();
-        });
+        if (sunburstChartDataRoot != null && sunburstChartDataRoot['children'] != null) {
+          final List<dynamic> childrenData = sunburstChartDataRoot['children'] as List<dynamic>;
+          setState(() {
+            _sunburstData = childrenData.map((item) => item as Map<String, dynamic>).toList();
+            // Calculate total expenses from the sum of children's values
+            _sunburstTotalExpenses = childrenData.fold(0.0, (sum, item) {
+              final num value = item['value'] as num? ?? 0.0;
+              return sum + value.toDouble();
+            });
+            // If the root node itself has a 'value' (e.g. "Total Expenses"), we could use that too.
+            // For now, summing children is robust.
+          });
+        } else {
+          // Handle cases where 'sunburstData' or its 'children' are missing
+          setState(() {
+            _sunburstData = null;
+            _sunburstTotalExpenses = null;
+          });
+        }
       } else {
         setState(() {
           _sunburstData = null;
@@ -185,11 +198,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 const SizedBox(width: 8),
                 ChoiceChip(
                   label: const Text('YTD'),
-                  selected: _selectedPeriod == 'ytd',
+                  selected: _selectedPeriod == 'yearToDate',
                   onSelected: (selected) {
                     if (selected) {
                       setState(() {
-                        _selectedPeriod = 'ytd';
+                        _selectedPeriod = 'yearToDate';
                         _dateOffset = 0; // YTD is always current year, offset 0
                       });
                       _fetchSankeyData();
