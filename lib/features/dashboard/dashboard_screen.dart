@@ -354,6 +354,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               alignment: ChartAlignment.center
                           ),
                           legend: Legend(isVisible: true, overflowMode: LegendItemOverflowMode.wrap, position: LegendPosition.bottom),
+                          palette: const <Color>[ 
+                            Colors.blue, Colors.green, Colors.orange, Colors.red, Colors.purple,
+                            Colors.brown, Colors.pink, Colors.teal, Colors.indigo, Colors.cyan,
+                            Colors.lime, Colors.amber,
+                          ],
                           series: <CircularSeries<Map<String, dynamic>, String>>[
                             DoughnutSeries<Map<String, dynamic>, String>(
                               dataSource: _categoryExpenseData,
@@ -361,7 +366,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                               yValueMapper: (Map<String, dynamic> data, _) => data['value'] as num,
                               dataLabelSettings: DataLabelSettings(
                                 isVisible: true,
-                                labelPosition: CircularLabelPosition.outside,
+                                labelPosition: ChartDataLabelPosition.outside,
                                 labelIntersectAction: LabelIntersectAction.shift,
                                 connectorLineSettings: const ConnectorLineSettings(type: ConnectorType.line, length: '8%'),
                                 builder: (dynamic data, dynamic point, dynamic series, int pointIndex, int seriesIndex) {
@@ -369,21 +374,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                   final String name = data['name'] as String;
                                   if (_totalCategorizedExpensesFromCloud != null && _totalCategorizedExpensesFromCloud! > 0 && value > 0) {
                                     final double percentage = (value / _totalCategorizedExpensesFromCloud!) * 100;
-                                    if (percentage < 3) return null; 
+                                    if (percentage < 3) return const SizedBox.shrink(); 
                                     return Text('${name} (${percentage.toStringAsFixed(1)}%)', style: const TextStyle(fontSize: 8, color: Colors.black87)); 
                                   }
                                   return Text(name, style: const TextStyle(fontSize: 8, color: Colors.black87));
                                 }
                               ),
-                              tooltipSettings: const TooltipSettings(enable: true, format: 'point.x: \$point.y'),
+                              enableTooltip: true,
                               innerRadius: '40%',
                               explode: true,
                               explodeIndex: 0, 
-                              palette: const <Color>[ 
-                                Colors.blue, Colors.green, Colors.orange, Colors.red, Colors.purple,
-                                Colors.brown, Colors.pink, Colors.teal, Colors.indigo, Colors.cyan,
-                                Colors.lime, Colors.amber,
-                              ],
                             ),
                           ],
                         ),
