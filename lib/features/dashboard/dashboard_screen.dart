@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_functions/cloud_functions.dart';
-import 'package:syncfusion_flutter_charts/charts.dart'; // Keep for Sunburst
-import 'package:sankey_flutter/sankey_flutter.dart'; // Import for new Sankey
+import 'package:syncfusion_flutter_charts/charts.dart'; // Keep for Doughnut
 import 'package:intl/intl.dart';
+import 'package:sankey_flutter/sankey_helpers.dart';
+import 'package:sankey_flutter/sankey_link.dart';
+import 'package:sankey_flutter/sankey_node.dart';
+// SankeyDiagramWidget is available via sankey_helpers.dart or directly if exported
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -12,7 +15,7 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  List<Map<String, dynamic>> _sankeyLinksData = [];
+  List<Map<String, dynamic>> _sankeyLinksData = []; // Raw data from Firebase
   bool _isLoading = false;
   String? _errorMessage;
   String _selectedPeriod = "monthly";
@@ -21,25 +24,40 @@ class _DashboardScreenState extends State<DashboardScreen> {
   double? _totalExpenses;
   double? _savingsBuffer;
 
-  // Sunburst chart specific state variables
-  List<Map<String, dynamic>>? _sunburstData;
-  double? _sunburstTotalExpenses;
-  bool _isSunburstLoading = false;
-  String? _sunburstErrorMessage;
+  // New Sankey specific state variables
+  List<SankeyNode> _sankeyNodes = [];
+  List<SankeyLink> _sankeyDiagramLinks = []; 
+  Map<String, Color> _sankeyNodeColors = {};
+  SankeyDataSet? _sankeyDataSet;
+  int? _selectedSankeyNodeId; 
+
+  // Doughnut chart specific state variables for category expenses
+  List<Map<String, dynamic>>? _categoryExpenseData;
+  double? _totalCategorizedExpensesFromCloud;
+  bool _isCategoryExpenseLoading = false;
+  String? _categoryExpenseErrorMessage;
 
   final FirebaseFunctions _functions = FirebaseFunctions.instance;
 
   @override
   void initState() {
     super.initState();
-    _fetchSankeyData();
-    _fetchSunburstData(); // Call to fetch sunburst data
+    // Fetch data with a default layout size.
+    // The LayoutBuilder in build will trigger a re-layout with actual constraints if needed.
+    _fetchSankeyData(); 
+    _fetchCategoryExpenseData();
   }
 
-  Future<void> _fetchSankeyData() async {
+  Future<void> _fetchSankeyData({Size layoutSize = const Size(600, 400)}) async { 
     setState(() {
       _isLoading = true;
       _errorMessage = null;
+      // Clear previous Sankey data for the new package
+      _sankeyNodes = [];
+      _sankeyDiagramLinks = [];
+      _sankeyNodeColors = {};
+      _sankeyDataSet = null;
+      _selectedSankeyNodeId = null;
     });
 
     try {
@@ -50,23 +68,73 @@ class _DashboardScreenState extends State<DashboardScreen> {
       });
 
       if (result.data != null && result.data['links'] != null) {
-        final List<dynamic> linksData = result.data['links'];
+        final List<dynamic> linksRawData = result.data['links'];
+        // Store the raw data in _sankeyLinksData
+        final List<Map<String, dynamic>> newSankeyLinksData = linksRawData.map((link) => {
+          'from': link['from'] as String,
+          'to': link['to'] as String,
+          'value': link['value'] as num,
+        }).toList();
+
+        // a. Create unique nodes and map them
+        final Map<String, SankeyNode> nodeMap = {};
+        int nodeIdCounter = 0;
+        for (var linkData in newSankeyLinksData) {
+          final String from = linkData['from'] as String;
+          final String to = linkData['to'] as String;
+          if (!nodeMap.containsKey(from)) {
+            nodeMap[from] = SankeyNode(id: nodeIdCounter++, label: from);
+          }
+          if (!nodeMap.containsKey(to)) {
+            nodeMap[to] = SankeyNode(id: nodeIdCounter++, label: to);
+          }
+        }
+        final List<SankeyNode> newNodes = nodeMap.values.toList();
+
+        // b. Create SankeyLinks using the SankeyNode objects
+        final List<SankeyLink> newLinks = newSankeyLinksData.map((linkData) {
+          final SankeyNode sourceNode = nodeMap[linkData['from'] as String]!;
+          final SankeyNode targetNode = nodeMap[linkData['to'] as String]!;
+          final double value = (linkData['value'] as num).toDouble();
+          // Ensure value is positive for sankey_flutter package
+          return SankeyLink(source: sourceNode, target: targetNode, value: value.abs());
+        }).toList();
+
+        // c. Generate node colors
+        final Map<String, Color> newNodeColors = generateDefaultNodeColorMap(newNodes);
+
+        // d. Create SankeyDataSet
+        final SankeyDataSet newDataSet = SankeyDataSet(nodes: newNodes, links: newLinks);
+
+        // e. Calculate layout using the provided or default layoutSize
+        final sankeyLayout = generateSankeyLayout(
+          width: layoutSize.width, 
+          height: layoutSize.height, 
+          nodeWidth: 15, 
+          nodePadding: 10, 
+        );
+        newDataSet.layout(sankeyLayout);
+
         setState(() {
-          _sankeyLinksData = linksData.map((link) => {
-            'from': link['from'] as String,
-            'to': link['to'] as String,
-            'value': link['value'] as num,
-          }).toList();
+          _sankeyLinksData = newSankeyLinksData; 
           _totalIncome = (result.data['totalIncome'] as num?)?.toDouble();
           _totalExpenses = (result.data['totalExpenses'] as num?)?.toDouble();
           _savingsBuffer = (result.data['savingsBuffer'] as num?)?.toDouble();
+          
+          _sankeyNodes = newNodes;
+          _sankeyDiagramLinks = newLinks; 
+          _sankeyNodeColors = newNodeColors;
+          _sankeyDataSet = newDataSet;
+          _errorMessage = null; 
         });
       } else {
         setState(() {
-          _sankeyLinksData = [];
+          _sankeyLinksData = []; 
           _totalIncome = null;
           _totalExpenses = null;
           _savingsBuffer = null;
+          _sankeyDataSet = null; 
+          _errorMessage = "No data received from the server.";
         });
       }
     } on FirebaseFunctionsException catch (e) {
@@ -76,6 +144,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _totalIncome = null;
         _totalExpenses = null;
         _savingsBuffer = null;
+        _sankeyDataSet = null; 
       });
     } catch (e) {
       setState(() {
@@ -84,6 +153,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _totalIncome = null;
         _totalExpenses = null;
         _savingsBuffer = null;
+        _sankeyDataSet = null; 
       });
     } finally {
       setState(() {
@@ -92,10 +162,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  Future<void> _fetchSunburstData() async {
+  Future<void> _fetchCategoryExpenseData() async {
     setState(() {
-      _isSunburstLoading = true;
-      _sunburstErrorMessage = null;
+      _isCategoryExpenseLoading = true;
+      _categoryExpenseErrorMessage = null;
     });
 
     try {
@@ -107,49 +177,42 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       if (result.data != null) {
         final Map<String, dynamic> responseData = result.data as Map<String, dynamic>;
-        // Adapt to the new structure where 'sunburstData' is the root node
-        final Map<String, dynamic>? sunburstChartDataRoot = responseData['sunburstData'] as Map<String, dynamic>?;
+        
+        final List<dynamic>? categoriesData = responseData['categories'] as List<dynamic>?;
+        final num? totalExpensesNum = responseData['totalCategorizedExpenses'] as num?;
 
-        if (sunburstChartDataRoot != null && sunburstChartDataRoot['children'] != null) {
-          final List<dynamic> childrenData = sunburstChartDataRoot['children'] as List<dynamic>;
+        if (categoriesData != null) {
           setState(() {
-            _sunburstData = childrenData.map((item) => item as Map<String, dynamic>).toList();
-            // Calculate total expenses from the sum of children's values
-            _sunburstTotalExpenses = childrenData.fold(0.0, (sum, item) {
-              final num value = item['value'] as num? ?? 0.0;
-              return sum + value.toDouble();
-            });
-            // If the root node itself has a 'value' (e.g. "Total Expenses"), we could use that too.
-            // For now, summing children is robust.
+            _categoryExpenseData = categoriesData.map((item) => item as Map<String, dynamic>).toList();
+            _totalCategorizedExpensesFromCloud = totalExpensesNum?.toDouble();
           });
         } else {
-          // Handle cases where 'sunburstData' or its 'children' are missing
           setState(() {
-            _sunburstData = null;
-            _sunburstTotalExpenses = null;
+            _categoryExpenseData = null;
+            _totalCategorizedExpensesFromCloud = null;
           });
         }
       } else {
         setState(() {
-          _sunburstData = null;
-          _sunburstTotalExpenses = null;
+          _categoryExpenseData = null;
+          _totalCategorizedExpensesFromCloud = null;
         });
       }
     } on FirebaseFunctionsException catch (e) {
       setState(() {
-        _sunburstErrorMessage = e.message ?? "An unknown error occurred while fetching Sunburst data.";
-        _sunburstData = null;
-        _sunburstTotalExpenses = null;
+        _categoryExpenseErrorMessage = e.message ?? "An unknown error occurred while fetching category expense data.";
+        _categoryExpenseData = null;
+        _totalCategorizedExpensesFromCloud = null;
       });
     } catch (e) {
       setState(() {
-        _sunburstErrorMessage = "An unexpected error occurred: $e";
-        _sunburstData = null;
-        _sunburstTotalExpenses = null;
+        _categoryExpenseErrorMessage = "An unexpected error occurred: $e";
+        _categoryExpenseData = null;
+        _totalCategorizedExpensesFromCloud = null;
       });
     } finally {
       setState(() {
-        _isSunburstLoading = false;
+        _isCategoryExpenseLoading = false;
       });
     }
   }
@@ -158,7 +221,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Sankey Diagram'),
+        title: const Text('Financial Dashboard'),
       ),
       body: Column(
         children: [
@@ -174,10 +237,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     if (selected) {
                       setState(() {
                         _selectedPeriod = 'monthly';
-                        _dateOffset = 0; // Reset offset when changing period type
+                        _dateOffset = 0; 
                       });
-                      _fetchSankeyData();
-                      _fetchSunburstData(); // Also fetch sunburst data
+                      _fetchSankeyData(); 
+                      _fetchCategoryExpenseData();
                     }
                   },
                 ),
@@ -189,10 +252,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     if (selected) {
                       setState(() {
                         _selectedPeriod = 'yearly';
-                        _dateOffset = 0; // Reset offset
+                        _dateOffset = 0; 
                       });
                       _fetchSankeyData();
-                      _fetchSunburstData(); // Also fetch sunburst data
+                      _fetchCategoryExpenseData();
                     }
                   },
                 ),
@@ -204,136 +267,119 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     if (selected) {
                       setState(() {
                         _selectedPeriod = 'yearToDate';
-                        _dateOffset = 0; // YTD is always current year, offset 0
+                        _dateOffset = 0; 
                       });
                       _fetchSankeyData();
-                      _fetchSunburstData(); // Also fetch sunburst data
+                      _fetchCategoryExpenseData();
                     }
                   },
                 ),
               ],
             ),
           ),
-          // Optional: Add Previous/Next buttons here for monthly/yearly
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
                 : _errorMessage != null
                     ? Center(child: Text('Error: $_errorMessage'))
-                    : _sankeyLinksData.isEmpty
+                    : (_sankeyDataSet == null || _sankeyDataSet!.nodes.isEmpty) 
                         ? const Center(child: Text('No data available for the selected period.'))
                         : Padding(
                             padding: const EdgeInsets.all(16.0),
-                            child: LayoutBuilder( // Use LayoutBuilder to get constraints for SankeyChart
+                            child: LayoutBuilder(
                               builder: (context, constraints) {
-                                // Data Transformation Logic
-                                final Set<String> nodeNamesSet = {};
-                                for (var link in _sankeyLinksData) {
-                                  nodeNamesSet.add(link['from'] as String);
-                                  nodeNamesSet.add(link['to'] as String);
-                                }
-                                final List<String> uniqueNodeNames = nodeNamesSet.toList();
-
-                                final List<SankeyNodeInfo> nodes = uniqueNodeNames
-                                    .map((name) => SankeyNodeInfo(label: name))
-                                    .toList();
-
-                                final List<SankeyLinkInfo> links = _sankeyLinksData.map((linkData) {
-                                  final String fromNodeName = linkData['from'] as String;
-                                  final String toNodeName = linkData['to'] as String;
-                                  final double value = (linkData['value'] as num).toDouble();
-                                  
-                                  final int sourceId = uniqueNodeNames.indexOf(fromNodeName);
-                                  final int targetId = uniqueNodeNames.indexOf(toNodeName);
-
-                                  return SankeyLinkInfo(
-                                    sourceId: sourceId,
-                                    targetId: targetId,
-                                    value: value,
+                                // Re-calculate layout with actual constraints if dataset exists
+                                if (_sankeyDataSet != null && _sankeyDataSet!.nodes.isNotEmpty) {
+                                  final sankeyLayout = generateSankeyLayout(
+                                    width: constraints.maxWidth,
+                                    height: constraints.maxHeight,
+                                    nodeWidth: 15, 
+                                    nodePadding: 10, 
                                   );
-                                }).toList();
+                                  _sankeyDataSet!.layout(sankeyLayout); // Update layout on existing dataset
 
-                                return SankeyChart(
-                                  links: links,
-                                  nodes: nodes,
-                                  nodeWidth: 12.0, // Example styling
-                                  nodeColor: Colors.blue.shade300, // Example styling
-                                  linkColor: Colors.grey.shade300, // Example styling
-                                  // labelStyle: TextStyle(fontSize: 10, color: Colors.black), // If available
-                                  // showLabels: true, // If available for node labels
-                                  height: constraints.maxHeight, 
-                                  width: constraints.maxWidth,
-                                );
+                                  return SizedBox( 
+                                    height: constraints.maxHeight,
+                                    width: constraints.maxWidth,
+                                    child: SankeyDiagramWidget(
+                                      data: _sankeyDataSet!,
+                                      nodeColors: _sankeyNodeColors,
+                                      selectedNodeId: _selectedSankeyNodeId,
+                                      onNodeTap: (int? nodeId) {
+                                        setState(() {
+                                          _selectedSankeyNodeId = nodeId;
+                                        });
+                                      },
+                                      size: Size(constraints.maxWidth, constraints.maxHeight),
+                                      showLabels: true,
+                                    ),
+                                  );
+                                } 
+                                return const Center(child: Text('Preparing Sankey data...'));
                               }
                             ),
                           ),
           ),
-          // Optional: Display summary figures
           if (_totalIncome != null && _totalExpenses != null && _savingsBuffer != null && !_isLoading && _errorMessage == null)
             Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
                 children: [
-                  Text('Total Income: ${_totalIncome?.toStringAsFixed(2)}'),
-                  Text('Total Expenses: ${_totalExpenses?.toStringAsFixed(2)}'),
-                  Text('Savings/Buffer: ${_savingsBuffer?.toStringAsFixed(2)}'),
+                  Text('Income: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_totalIncome)}'),
+                  Text('Expenses: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_totalExpenses)}'),
+                  Text('Buffer: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_savingsBuffer)}'),
                 ],
               ),
             ),
-          // --- Sunburst Chart Section ---
           Padding(
             padding: const EdgeInsets.all(16.0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (_isSunburstLoading)
+                if (_isCategoryExpenseLoading)
                   const Center(child: CircularProgressIndicator())
-                else if (_sunburstErrorMessage != null)
-                  Center(child: Text('Sunburst Error: $_sunburstErrorMessage'))
-                else if (_sunburstData != null && _sunburstData!.isNotEmpty)
+                else if (_categoryExpenseErrorMessage != null)
+                  Center(child: Text('Category Expense Error: $_categoryExpenseErrorMessage'))
+                else if (_categoryExpenseData != null && _categoryExpenseData!.isNotEmpty)
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Text( // Title is now part of SfCircularChart
-                      //   'Spending Breakdown ${(_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) ? "- Total: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_sunburstTotalExpenses)} " : ""}',
-                      //   style: Theme.of(context).textTheme.titleLarge,
-                      // ),
-                      // const SizedBox(height: 8), // Adjust spacing if needed
                       SizedBox(
-                        height: 350, // Keep or adjust height as needed
+                        height: 300, 
                         child: SfCircularChart(
                           title: ChartTitle(
-                              text: 'Spending Breakdown ${(_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0) ? "\nTotal: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_sunburstTotalExpenses)}" : ""}',
+                              text: 'Spending Breakdown ${(_totalCategorizedExpensesFromCloud != null && _totalCategorizedExpensesFromCloud! > 0) ? "\nTotal: ${NumberFormat.compactCurrency(locale: 'en_US', symbol: '\$').format(_totalCategorizedExpensesFromCloud)}" : ""}',
                               textStyle: Theme.of(context).textTheme.titleMedium,
                               alignment: ChartAlignment.center
                           ),
-                          legend: Legend(isVisible: true, overflowMode: LegendItemOverflowMode.wrap),
+                          legend: Legend(isVisible: true, overflowMode: LegendItemOverflowMode.wrap, position: LegendPosition.bottom),
                           series: <CircularSeries<Map<String, dynamic>, String>>[
                             DoughnutSeries<Map<String, dynamic>, String>(
-                              dataSource: _sunburstData,
+                              dataSource: _categoryExpenseData,
                               xValueMapper: (Map<String, dynamic> data, _) => data['name'] as String,
                               yValueMapper: (Map<String, dynamic> data, _) => data['value'] as num,
                               dataLabelSettings: DataLabelSettings(
                                 isVisible: true,
                                 labelPosition: CircularLabelPosition.outside,
                                 labelIntersectAction: LabelIntersectAction.shift,
-                                connectorLineSettings: const ConnectorLineSettings(type: ConnectorType.line, length: '10%'),
+                                connectorLineSettings: const ConnectorLineSettings(type: ConnectorType.line, length: '8%'),
                                 builder: (dynamic data, dynamic point, dynamic series, int pointIndex, int seriesIndex) {
                                   final num value = data['value'] as num;
                                   final String name = data['name'] as String;
-                                  if (_sunburstTotalExpenses != null && _sunburstTotalExpenses! > 0 && value > 0) {
-                                    final double percentage = (value / _sunburstTotalExpenses!) * 100;
-                                    if (percentage < 3) return null; // Hide label for very small segments
-                                    return Text('${name}\n(${percentage.toStringAsFixed(1)}%)', style: const TextStyle(fontSize: 9, color: Colors.black87));
+                                  if (_totalCategorizedExpensesFromCloud != null && _totalCategorizedExpensesFromCloud! > 0 && value > 0) {
+                                    final double percentage = (value / _totalCategorizedExpensesFromCloud!) * 100;
+                                    if (percentage < 3) return null; 
+                                    return Text('${name} (${percentage.toStringAsFixed(1)}%)', style: const TextStyle(fontSize: 8, color: Colors.black87)); 
                                   }
-                                  return Text(name, style: const TextStyle(fontSize: 9, color: Colors.black87)); // Fallback
+                                  return Text(name, style: const TextStyle(fontSize: 8, color: Colors.black87));
                                 }
                               ),
-                              tooltipSettings: const TooltipSettings(enable: true, format: 'point.x: \$point.y'), // Updated format
+                              tooltipSettings: const TooltipSettings(enable: true, format: 'point.x: \$point.y'),
                               innerRadius: '40%',
                               explode: true,
-                              explodeIndex: 0, // Explode the first segment
-                              palette: const <Color>[ // Example palette
+                              explodeIndex: 0, 
+                              palette: const <Color>[ 
                                 Colors.blue, Colors.green, Colors.orange, Colors.red, Colors.purple,
                                 Colors.brown, Colors.pink, Colors.teal, Colors.indigo, Colors.cyan,
                                 Colors.lime, Colors.amber,

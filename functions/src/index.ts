@@ -2449,25 +2449,25 @@ export const getSunburstData = onCall(async (request) => {
       throw new HttpsError("internal", "An error occurred while fetching financial data for the Sunburst chart.");
     }
 
-    // 6. Format data for Sunburst chart
-    const sunburstData = {
-      name: "Total Expenses",
-      children: [] as { name: string; value: number }[],
-    };
+    // 6. Create categoryList and calculate totalCategorizedExpenses
+    const categoryList: { name: string; value: number }[] = [];
+    let totalCategorizedExpenses = 0;
 
     try {
       for (const categoryName in expenseCategories) {
         if (Object.prototype.hasOwnProperty.call(expenseCategories, categoryName)) {
-          sunburstData.children.push({
+          const value = expenseCategories[categoryName];
+          categoryList.push({
             name: categoryName,
-            value: expenseCategories[categoryName],
+            value: value,
           });
+          totalCategorizedExpenses += value;
         }
       }
-      logger.info("Formatted Sunburst data:", { userId, sunburstData });
+      logger.info("Created categoryList and totalCategorizedExpenses for Sunburst:", { userId, categoryList, totalCategorizedExpenses });
     } catch (formatError) {
-      logger.error("Error formatting Sunburst data:", { userId, period, dateOffset, error: formatError });
-      throw new HttpsError("internal", "An error occurred while formatting data for the Sunburst chart.");
+      logger.error("Error creating categoryList or calculating totalCategorizedExpenses:", { userId, period, dateOffset, error: formatError });
+      throw new HttpsError("internal", "An error occurred while formatting expense data.");
     }
 
     // 7. Return Processed Data
@@ -2482,7 +2482,8 @@ export const getSunburstData = onCall(async (request) => {
           endDate: dateRange.endDate.toDate().toISOString(),
         },
         transactionsFetched: fetchedTransactionsCount,
-        sunburstData,
+        categories: categoryList, // New field
+        totalCategorizedExpenses: totalCategorizedExpenses, // New field
       },
     };
   } catch (error) {
